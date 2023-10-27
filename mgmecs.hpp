@@ -422,14 +422,13 @@ namespace mgm {
             new_entity_ids.reserve(num);
 
             if (available_entities.empty()) {
-                std::vector<EntityInfo> new_entities{};
-                new_entities.resize(num);
                 Entity num_entities = (Entity)entities.size();
-                for (auto& e : new_entities) {
-                    e = EntityInfo{};
+                entities.resize(entities.size() + num);
+                for (auto e = entities.end() - num; e != entities.end(); e++) {
+                    auto& e_id = *e;
+                    e_id = EntityInfo{};
                     new_entity_ids.emplace_back(num_entities++);
                 }
-                entities.insert(entities.end(), new_entities.begin(), new_entities.end());
             }
             else if (num <= available_entities.size()) {
                 for (auto e = available_entities.end() - num; e != available_entities.end(); e++) {
