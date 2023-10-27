@@ -498,12 +498,11 @@ namespace mgm {
          * @param entities A vector with all entity IDs to destroy
          */
         void destroy(const std::vector<Entity> entities) {
-            for (auto& [tid, type_pool] : type_pools) {
-                for (const auto& e : entities) {
+            for (const auto& e : entities) {
+                for (auto& [tid, type_pool] : type_pools)
                     type_pool.try_remove(e);
-                    this->entities[e].flags = EntityFlag_TOOMBSTONE;
-                    available_entities.push_back(e);
-                }
+                this->entities[e].flags = EntityFlag_TOOMBSTONE;
+                available_entities.push_back(e);
             }
         }
 
