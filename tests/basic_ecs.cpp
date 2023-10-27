@@ -37,7 +37,7 @@ int main() {
 
     mgm::ComponentReference cr{};
 
-    std::cout << "\nTesting component reverences" << std::endl;
+    std::cout << "\nTesting component references" << std::endl;
     ecs.emplace<int>(0, 69);
     const auto refs = ecs.get_all(0);
     for (const auto& ct : refs) {
@@ -70,7 +70,7 @@ int main() {
     std::cout << std::endl;
 
     std::cout << "\nTesting creating a number of entities more than available entities" << std::endl;
-    destroyed_ents = ecs.create(3);
+    destroyed_ents = ecs.create(5);
     for (const auto& e : destroyed_ents) {
         ecs.emplace<uint32_t>(e, i++);
     }
