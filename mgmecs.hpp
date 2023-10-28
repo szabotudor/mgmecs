@@ -14,12 +14,12 @@ namespace mgm {
     constexpr Entity null = (Entity)-1;
     constexpr Component null_component = (Component)-1;
     constexpr uint32_t null_type_id = (uint32_t)-1;
-    
+
     struct EntityReference {
         private:
         friend class MgmEcs;
 
-        EntityReference(class MgmEcs& ecs, const Entity entity) : num_refs{new uint32_t{1}}, ecs{&ecs}, entity{entity} {}
+        EntityReference(const class MgmEcs& ecs, const Entity entity) : num_refs{new uint32_t{1}}, ecs{&ecs}, entity{entity} {}
 
         public:
         EntityReference() = default;
@@ -46,11 +46,10 @@ namespace mgm {
         }
 
         uint32_t* num_refs = nullptr;
-        MgmEcs* ecs = nullptr;
+        const MgmEcs* ecs = nullptr;
         Entity entity = null;
 
         bool is_valid() const { return ecs != nullptr; }
-        template<typename T> T& get();
         template<typename T> const T& get() const;
         void destroy_original();
 
@@ -76,7 +75,7 @@ namespace mgm {
         friend class MgmEcs;
         using EntityReference::EntityReference;
 
-        ComponentReference(class MgmEcs& ecs, const Entity entity, const uint32_t type_id) {
+        ComponentReference(const class MgmEcs& ecs, const Entity entity, const uint32_t type_id) {
             num_refs = new uint32_t{1};
             this->ecs = &ecs;
             this->entity = entity;
@@ -86,7 +85,6 @@ namespace mgm {
         public:
         uint32_t type_id = null;
 
-        template<typename T> T& get();
         template<typename T> const T& get() const;
         void destroy_original();
 
@@ -112,8 +110,8 @@ namespace mgm {
         template<typename Type, size_t S = 256>
         class PackedMapWithSparseSearch {
             struct PageMember {
-                Component value;
-                bool registered = false;
+                Component value : (sizeof(Component) - 1);
+                bool registered : 1 = false;
             };
             struct Page {
                 PageMember* data = nullptr;
@@ -145,29 +143,16 @@ namespace mgm {
                 } while (right - left > 1);
                 return PageIndex{ true, left };
             }
-            Page& get_page(const uint32_t page_id) {
+            Page& get_page(const uint32_t page_id) const {
                 if (pages.empty())
                     throw std::runtime_error("No component of this type exists");
 
-                if (pages.front().id == page_id) return pages.front();
-                if (pages.back().id == page_id) return pages.back();
+                if (pages.front().id == page_id) return const_cast<Page&>(pages.front());
+                if (pages.back().id == page_id) return const_cast<Page&>(pages.back());
 
                 const PageIndex page = try_get_page_index(page_id);
                 if (!page.is_insert_point)
-                    return pages[page.pos];
-
-                throw std::runtime_error("Entity doesn't exist, or isn't registered for this component type");
-            }
-            const Page& get_page(const uint32_t page_id) const {
-                if (pages.empty())
-                    throw std::runtime_error("No component of this type exists");
-
-                if (pages.front().id == page_id) return pages.front();
-                if (pages.back().id == page_id) return pages.back();
-
-                const PageIndex page = try_get_page_index(page_id);
-                if (!page.is_insert_point)
-                    return pages[page.pos];
+                    return const_cast<Page&>(pages[page.pos]);
 
                 throw std::runtime_error("Entity doesn't exist, or isn't registered for this component type");
             }
@@ -183,7 +168,7 @@ namespace mgm {
                     return pages[page.pos];
 
                 pages.emplace(pages.begin() + page.pos + 1, Page{std::allocator<PageMember>{}.allocate(S), page_id});
-                return pages[page_id];
+                return pages[page.pos];
             }
 
             public:
@@ -220,24 +205,15 @@ namespace mgm {
                 return data[component.value].second;
             }
 
-            const Type& get(const Entity entity) const {
+            Type& get(const Entity entity) const {
                 const uint32_t page_id = entity / S;
-                const Page& page = get_page(page_id);
-                const PageMember& component = page.data[entity - page_id * S];
+                const PageMember& component = get_page(page_id).data[entity - page_id * S];
                 if (!component.registered)
                     throw std::runtime_error("Entity doesn't exist, or isn't registered for this component type");
-                return data[component.value].second;
-            }
-            Type& get(const Entity entity) {
-                const uint32_t page_id = entity / S;
-                const Page& page = get_page(page_id);
-                const PageMember& component = page.data[entity - page_id * S];
-                if (!component.registered)
-                    throw std::runtime_error("Entity doesn't exist, or isn't registered for this component type");
-                return data[component.value].second;
+                return *const_cast<Type*>(&data[component.value].second);
             }
 
-            const Type* try_get(const Entity entity) const {
+            Type* try_get(const Entity entity) const {
                 const uint32_t page_id = entity / S;
                 const PageIndex page_index = try_get_page_index(page_id);
                 if (page_index.is_insert_point)
@@ -246,18 +222,7 @@ namespace mgm {
                 const PageMember& component = page.data[entity - page_id * S];
                 if (!component.registered)
                     return nullptr;
-                return &data[component.value].second;
-            }
-            Type* try_get(const Entity entity) {
-                const uint32_t page_id = entity / S;
-                const PageIndex page_index = try_get_page_index(page_id);
-                if (page_index.is_insert_point)
-                    return nullptr;
-                const Page& page = pages[page_index.pos];
-                const PageMember& component = page.data[entity - page_id * S];
-                if (!component.registered)
-                    return nullptr;
-                return &data[component.value].second;
+                return const_cast<Type*>(&data[component.value].second);
             }
 
             template<typename... Ts>
@@ -290,7 +255,7 @@ namespace mgm {
                 entity = data[component.value].first;
                 page_id = entity / S;
                 Page& old_page = get_page(page_id);
-                PageMember& old_component = page.data[entity - page_id * S];
+                PageMember& old_component = old_page.data[entity - page_id * S];
                 old_component.value = component.value;
 
                 component.value = 0;
@@ -310,7 +275,7 @@ namespace mgm {
                 entity = data[component.value].first;
                 page_id = entity / S;
                 Page& old_page = get_page(page_id);
-                PageMember& old_component = page.data[entity - page_id * S];
+                PageMember& old_component = old_page.data[entity - page_id * S];
                 old_component.value = component.value;
 
                 component.value = 0;
@@ -320,9 +285,6 @@ namespace mgm {
 
             ~PackedMapWithSparseSearch() {
                 for (auto& page : pages) {
-                    for (uint32_t i = 0; i < S; i++)
-                        if (page.data[i].registered)
-                            page.data[i].value.~Component();
                     std::allocator<PageMember>{}.deallocate(page.data, S);
                 }
             }
@@ -339,17 +301,22 @@ namespace mgm {
             void* data = nullptr;
             uint32_t type_id = 0;
 
-            std::function<void(const Entity)> remove{};
-            std::function<void(const Entity)> try_remove{};
-            std::function<bool(const Entity)> has{};
+            std::function<void(ComponentPool&, const Entity)> remove{};
+            std::function<void(ComponentPool&, const Entity)> try_remove{};
+            std::function<bool(const ComponentPool&, const Entity)> has{};
+            std::function<void(ComponentPool& pool)> free{};
 
             template<typename T>
             PackedMapWithSparseSearch<T>& map() const {
                 return *reinterpret_cast<PackedMapWithSparseSearch<T>*>(data);
             }
+
+            ~ComponentPool() {
+                free(*this);
+            }
         };
         template<typename T>
-        PackedMapWithSparseSearch<T>& get_type_pool_map() {
+        PackedMapWithSparseSearch<T>& get_or_create_type_pool_map() {
             auto it = type_pools.find(type_id<T>);
             if (it == type_pools.end()) {
                 create_type_pool<T>();
@@ -361,14 +328,14 @@ namespace mgm {
             return pool.map<T>();
         }
         template<typename T>
-        const PackedMapWithSparseSearch<T>& get_type_pool_map() const {
+        PackedMapWithSparseSearch<T>& get_type_pool_map() const {
             auto it = type_pools.find(type_id<T>);
             if (it == type_pools.end())
                 throw std::runtime_error("Tried to access unregistered type");
             const ComponentPool& pool = it->second;
             if (pool.type_id != type_id<T>)
                 throw std::runtime_error("INTERNAL: Getting wrong pool type");
-            return pool.map<T>();
+            return const_cast<PackedMapWithSparseSearch<T>&>(pool.map<T>());
         }
         std::unordered_map<uint32_t, ComponentPool> type_pools{};
 
@@ -381,9 +348,10 @@ namespace mgm {
 
             pool.data = new PackedMapWithSparseSearch<T>;
             pool.type_id = type_id<T>;
-            pool.remove = [pool](const Entity entity) { pool.map<T>().destroy(entity); };
-            pool.try_remove = [pool](const Entity entity) { pool.map<T>().try_destroy(entity); };
-            pool.has = [this](const Entity entity) { return try_get<T>(entity) != nullptr; };
+            pool.remove = [](ComponentPool& pool, const Entity entity) { pool.map<T>().destroy(entity); };
+            pool.try_remove = [](ComponentPool& pool, const Entity entity) { pool.map<T>().try_destroy(entity); };
+            pool.has = [](const ComponentPool& pool, const Entity entity) { return pool.map<T>().try_get(entity) != nullptr; };
+            pool.free = [](ComponentPool& pool) { delete static_cast<PackedMapWithSparseSearch<T>*>(pool.data); };
             return type_id<T>;
         }
 
@@ -457,7 +425,7 @@ namespace mgm {
          * @param entity The ID of the entity to get
          * @return The reference to the entity
          */
-        EntityReference entity_reference(const Entity entity) {
+        EntityReference entity_reference(const Entity entity) const {
             return EntityReference{*this, entity};
         }
 
@@ -466,7 +434,7 @@ namespace mgm {
          * 
          * @return A vector with all entities
          */
-        std::vector<Entity> all() {
+        std::vector<Entity> all() const {
             std::vector<Entity> res{};
             res.reserve(entities.size());
             for (Entity i = 0; i < entities.size(); i++)
@@ -486,7 +454,7 @@ namespace mgm {
 
             auto components = get_all(entity);
             for (auto& type_pool : type_pools)
-                type_pool.second.remove(entity);
+                type_pool.second.remove(type_pool.second, entity);
             entities[entity].flags = EntityFlag_TOOMBSTONE;
             available_entities.push_back(entity);
         }
@@ -499,7 +467,7 @@ namespace mgm {
         void destroy(const std::vector<Entity> entities) {
             for (const auto& e : entities) {
                 for (auto& [tid, type_pool] : type_pools)
-                    type_pool.try_remove(e);
+                    type_pool.try_remove(type_pool, e);
                 this->entities[e].flags = EntityFlag_TOOMBSTONE;
                 available_entities.push_back(e);
             }
@@ -515,7 +483,7 @@ namespace mgm {
          */
         template<typename T, typename... Ts>
         T& emplace(const Entity entity, Ts&&... args) {
-            PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
+            PackedMapWithSparseSearch<T>& map = get_or_create_type_pool_map<T>();
             return map.emplace(entity, args...);
         }
 
@@ -527,21 +495,8 @@ namespace mgm {
          * @return A reference to the component
          */
         template<typename T>
-        const T& get(const Entity entity) const {
+        T& get(const Entity entity) const {
             const PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
-            return map.get(entity);
-        }
-
-        /**
-         * @brief Get a reference to a component
-         * 
-         * @tparam T The type of component to get
-         * @param entity The ID of the entity to get the component from
-         * @return A reference to the component
-         */
-        template<typename T>
-        T& get(const Entity entity) {
-            PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
             return map.get(entity);
         }
 
@@ -551,13 +506,13 @@ namespace mgm {
          * @param entity The ID of the entity to get
          * @return A vector with Component References to all components
          */
-        std::vector<ComponentReference> get_all(const Entity entity) {
+        std::vector<ComponentReference> get_all(const Entity entity) const {
             if (entities[entity].flags & EntityFlag_TOOMBSTONE)
                 throw std::runtime_error("Entity doesn't exist");
 
             std::vector<ComponentReference> components{};
             for (const auto& [type_id, type_pool] : type_pools) {
-                if (!type_pool.has(entity))
+                if (!type_pool.has(type_pool, entity))
                     continue;
                 ComponentReference cr{*this, entity, type_id};
                 components.emplace_back(std::move(cr));
@@ -575,7 +530,7 @@ namespace mgm {
          */
         template<typename T, typename... Ts>
         T& get_or_emplace(const Entity entity, Ts&&... args) {
-            return get_type_pool_map<T>().get_or_emplace(entity, args...);
+            return get_or_create_type_pool_map<T>().get_or_emplace(entity, args...);
         }
 
         /**
@@ -586,28 +541,12 @@ namespace mgm {
          * @return A pointer to the component, or nullptr if it doesn't exist
          */
         template<typename T>
-        const T* try_get(const Entity entity) const {
+        T* try_get(const Entity entity) const {
             if (entities[entity].flags & EntityFlag_TOOMBSTONE)
                 return nullptr;
 
             const PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
-            return map.try_get(entity);
-        }
-
-        /**
-         * @brief Get a component from an entity
-         * 
-         * @tparam T The type of component to get
-         * @param entity The ID of the entity to get the component from
-         * @return A pointer to the component, or nullptr if it doesn't exist
-         */
-        template<typename T>
-        T* try_get(const Entity entity) {
-            if (entities[entity].flags & EntityFlag_TOOMBSTONE)
-                return nullptr;
-
-            PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
-            return map.try_get(entity);
+            return const_cast<T*>(map.try_get(entity));
         }
         
         /**
@@ -667,16 +606,11 @@ namespace mgm {
             }
         }
 
-        ~MgmEcs() {}
+        ~MgmEcs() {
+            destroy(all());
+        }
     };
 
-    template<typename T>
-    T& EntityReference::get() {
-        if (ecs == nullptr)
-            throw std::runtime_error("Invalid reference, or wrong type");
-        auto& map = ecs->get_type_pool_map<T>();
-        return map.get(entity);
-    }
     template<typename T>
     const T& EntityReference::get() const {
         if (ecs == nullptr)
@@ -690,17 +624,10 @@ namespace mgm {
             throw std::runtime_error("Invalid reference");
         if (*num_refs > 1)
             throw std::runtime_error("Other references are using this entity, so it cannot be destroyed");
-        ecs->destroy(entity);
+        const_cast<MgmEcs*>(ecs)->destroy(entity);
         invalidate();
     }
 
-    template<typename T>
-    T& ComponentReference::get() {
-        if (ecs == nullptr || type_id != MgmEcs::type_id<T>)
-            throw std::runtime_error("Invalid reference, or wrong type");
-        auto& map = ecs->get_type_pool_map<T>();
-        return map.get(entity);
-    }
     template<typename T>
     const T& ComponentReference::get() const {
         if (ecs == nullptr || type_id != MgmEcs::type_id<T>)
@@ -714,7 +641,8 @@ namespace mgm {
             throw std::runtime_error("Invalid reference");
         if (*num_refs > 1)
             throw std::runtime_error("Other references are using this component, so it cannot be destroyed");
-        ecs->type_pools[type_id].remove(entity);
+        MgmEcs::ComponentPool& type_pool = const_cast<MgmEcs*>(ecs)->type_pools[type_id];
+        type_pool.remove(type_pool, entity);
         invalidate();
     }
 }
