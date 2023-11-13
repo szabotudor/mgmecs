@@ -110,15 +110,14 @@ namespace mgm {
         template<typename Type, size_t S = 256>
         class PackedMapWithSparseSearch {
             struct PageMember {
-                Component value : (sizeof(Component) - 1);
-                bool registered : 1 = false;
+                Type value;
+                Entity entity = null;
             };
             struct Page {
                 PageMember* data = nullptr;
                 uint32_t id = 0;
             };
             std::vector<Page> pages{};
-            std::vector<std::pair<Entity, Type>> data{};
 
             struct PageIndex {
                 bool is_insert_point = false;
@@ -144,7 +143,7 @@ namespace mgm {
             }
             Page& get_page(const uint32_t page_id) const {
                 if (pages.front().id == page_id) return const_cast<Page&>(pages.front());
-                if (pages.back().id == page_id) return const_cast<Page&>(pages.back());
+                else if (pages.back().id == page_id) return const_cast<Page&>(pages.back());
 
                 const PageIndex page = try_get_page_index(page_id);
                 if (!page.is_insert_point)
@@ -161,7 +160,9 @@ namespace mgm {
                     return pages[page.pos];
 
                 page.pos++;
-                pages.emplace(pages.begin() + page.pos, Page{new PageMember[S]{}, page_id});
+                const auto& it = pages.emplace(pages.begin() + page.pos, Page{std::allocator<PageMember>{}.allocate(S), page_id});
+                for (uint32_t i = 0; i < S; i++)
+                    it->data[i].entity = null;
                 return pages[page.pos];
             }
 
@@ -181,86 +182,74 @@ namespace mgm {
             }
 
             PackedMapWithSparseSearch() {
-                data.reserve(S);
-                pages.emplace_back(Page{new PageMember[S]{}, 0});
+                const auto& page = pages.emplace_back(Page{std::allocator<PageMember>{}.allocate(S), 0});
+                for (uint32_t i = 0; i < S; i++)
+                    page.data[i].entity = null;
             }
 
             template<typename... Ts>
             Type& emplace(const Entity entity, Ts&&... args) {
                 PageMember& component = get_or_create_page(entity / S).data[entity % S];
-                if (component.registered)
+                if (component.entity != null)
                     throw std::runtime_error("Entity already exists");
-                component.value = data.size();
-                component.registered = true;
-                if constexpr (sizeof...(args) > 0)
-                    data.emplace_back(entity, args...);
-                else
-                    data.emplace_back(entity, Type{});
-                return data[component.value].second;
+                memset(&component, 0, sizeof(PageMember));
+                new (&component.value) Type{args...};
+                component.entity = entity;
+                return component.value;
             }
 
             template<typename... Ts>
             Type& get_or_emplace(const Entity entity, Ts&&... args) {
                 PageMember& component = get_or_create_page(entity / S).data[entity % S];
-                if (component.registered)
-                    return data[component.value].second;
-                component.value = data.size();
-                component.registered = true;
-                if constexpr (sizeof...(args) > 0)
-                    data.emplace_back(entity, args...);
-                else
-                    data.emplace_back(entity, Type{});
-                return data[component.value].second;
+                if (component.entity != null)
+                    return component.value;
+                memset(&component, 0, sizeof(PageMember));
+                new (&component.value) Type{args...};
+                component.entity = entity;
+                return component.value;
             }
 
             Type& get(const Entity entity) const {
                 const PageMember& component = get_page(entity / S).data[entity % S];
-                if (!component.registered)
+                if (component.entity == null)
                     throw std::runtime_error("Entity doesn't exist, or isn't registered for this component type");
-                return *const_cast<Type*>(&data[component.value].second);
+                return *const_cast<Type*>(&component.value);
             }
 
             Type* try_get(const Entity entity) const {
                 const PageIndex page_index = try_get_page_index(entity / S);
                 if (page_index.is_insert_point)
                     return nullptr;
-                const Page& page = pages[page_index.pos];
-                const PageMember& component = page.data[entity % S];
-                if (!component.registered)
+                const PageMember& component = pages[page_index.pos].data[entity % S];
+                if (component.entity == null)
                     return nullptr;
-                return const_cast<Type*>(&data[component.value].second);
+                return const_cast<Type*>(&component.value);
             }
 
             void destroy(const Entity entity) {
                 PageMember& component = get_page(entity / S).data[entity % S];
-                if (!component.registered)
+                if (component.entity == null)
                     throw std::runtime_error("Entity doesn't exist, or isn't registered for this component type");
-                if (component.value != data.size() - 1)
-                    std::swap(data[component.value], data.back());
-                data.pop_back();
-
-                get_page(data[component.value].first / S).data[data[component.value].first % S].value = component.value;
-
-                component.value = 0;
-                component.registered = false;
+                component.value.~Type();
+                component.entity = null;
             }
             void try_destroy(Entity entity) {
                 PageMember& component = get_page(entity / S).data[entity % S];
-                if (!component.registered)
+                if (component.entity == null)
                     return;
-                if (component.value != data.size() - 1)
-                    std::swap(data[component.value], data.back());
-                data.pop_back();
-
-                get_page(data[component.value].first / S).data[data[component.value].first % S].value = component.value;
-
-                component.value = 0;
-                component.registered = false;
+                component.value.~Type();
+                component.entity = null;
             }
 
             ~PackedMapWithSparseSearch() {
                 for (auto& page : pages) {
-                    delete[] page.data;
+                    for (uint32_t i = 0; i < S; i++) {
+                        if (page.data[i].entity != null) {
+                            page.data[i].value.~Type();
+                            memset(&page.data[i].value, 0, sizeof(S));
+                        }
+                    }
+                    std::allocator<PageMember>{}.deallocate(page.data, S);
                 }
             }
         };
@@ -292,11 +281,10 @@ namespace mgm {
         template<typename T>
         PackedMapWithSparseSearch<T>& get_or_create_type_pool_map() {
             auto it = type_pools.find(type_id<T>);
-            if (it == type_pools.end()) {
-                create_type_pool<T>();
-                it = type_pools.find(type_id<T>);
-            }
-            ComponentPool& pool = it->second;
+            if (it != type_pools.end())
+                return it->second.template map<T>();
+
+            ComponentPool& pool = create_type_pool<T>();
             return pool.map<T>();
         }
         template<typename T>
@@ -313,7 +301,7 @@ namespace mgm {
         std::vector<Entity> available_entities{};
 
         template<typename T>
-        uint32_t create_type_pool() {
+        ComponentPool& create_type_pool() {
             ComponentPool& pool = type_pools[type_id<T>];
 
             pool.data = new PackedMapWithSparseSearch<T>;
@@ -321,7 +309,7 @@ namespace mgm {
             pool.try_remove = [](ComponentPool& pool, const Entity entity) { pool.map<T>().try_destroy(entity); };
             pool.has = [](const ComponentPool& pool, const Entity entity) { return pool.map<T>().try_get(entity) != nullptr; };
             pool.free = [](ComponentPool& pool) { delete static_cast<PackedMapWithSparseSearch<T>*>(pool.data); };
-            return type_id<T>;
+            return pool;
         }
 
         public:
