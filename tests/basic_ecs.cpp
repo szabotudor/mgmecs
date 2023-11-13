@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <chrono>
 
 
 struct TestInt {
@@ -18,15 +19,45 @@ struct TestInt {
     }
     int value = 0;
 
-    TestInt(const int v) : value{v} {
-        std::cout << "Initialized:" << value << std::endl;
-    }
-    ~TestInt() {
-        std::cout << "Destructed:" << value << std::endl;
-    }
+    TestInt(const int v) : value{v} {}
+    ~TestInt() = default;
 };
 
+auto test_mgmecs(const uint32_t num_ents) {
+    auto start = std::chrono::high_resolution_clock::now();
+    mgm::MgmEcs ecs{};
+    auto ents = ecs.create(num_ents);
+    int i = 467831;
+    for (const auto& e : ents) {
+        ecs.emplace<TestInt>(e, i);
+        i ^= (i << 7) ^ (i >> 13) ^ (i << 8);
+    }
+
+    for (const auto& e : ents) {
+        ecs.remove<TestInt>(e);
+    }
+
+    return std::chrono::high_resolution_clock::now() - start;
+}
+
+
 int main() {
+    constexpr uint32_t num_iterations = 10000;
+    constexpr uint32_t num_entities = 4000;
+    std::cout << "Creation and destruction time test: " << num_iterations << " iterations of " << num_entities << " entities..." << std::endl;
+
+    {
+        for (int i = 0; i < num_iterations / 10; i++) {
+            test_mgmecs(num_entities);
+        }
+        auto start = std::chrono::high_resolution_clock::time_point{};
+        auto avg = std::chrono::time_point<std::chrono::high_resolution_clock>{};
+        for (int i = 0; i < num_iterations; i++) {
+            avg += test_mgmecs(num_entities);
+        }
+        std::cout << "Average MgMecs Time : " << ((avg - start).count() / num_iterations) << " nanoseconds" << std::endl;
+    }
+
     mgm::MgmEcs ecs{};
     std::cout << "\nTesting creating a number of entities" << std::endl;
     const auto ents  = ecs.create(100);
