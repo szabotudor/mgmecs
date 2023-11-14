@@ -151,6 +151,8 @@ namespace mgm {
                 uint32_t id = 0;
             };
             std::vector<Page> pages{};
+            uint32_t cached_page_id = 0;
+            uint32_t cached_page_index = 0;
 
             struct PageIndex {
                 bool is_insert_point = false;
@@ -172,30 +174,35 @@ namespace mgm {
                     else if (pages[i].id == page_id)
                         return PageIndex{ false, i };
                 } while (right - left > 1);
-                return PageIndex{ true, left };
+                return PageIndex{ pages[left].id != page_id, left };
             }
             Page& get_page(const uint32_t page_id) const {
-                if (pages.front().id == page_id) return const_cast<Page&>(pages.front());
-                else if (pages.back().id == page_id) return const_cast<Page&>(pages.back());
+                if (page_id == cached_page_id) return const_cast<Page&>(pages[cached_page_index]);
 
                 const PageIndex page = try_get_page_index(page_id);
-                if (!page.is_insert_point)
+                if (!page.is_insert_point) {
+                    const_cast<PackedMapWithSparseSearch<Type, S>*>(this)->cached_page_id = page_id;
+                    const_cast<PackedMapWithSparseSearch<Type, S>*>(this)->cached_page_index = page.pos;
                     return const_cast<Page&>(pages[page.pos]);
+                }
 
                 throw std::runtime_error("Entity doesn't exist, or isn't registered for this component type");
             }
             Page& get_or_create_page(const uint32_t page_id) {
-                if (pages.front().id == page_id) return pages.front();
-                else if (pages.back().id == page_id) return pages.back();
+                if (page_id == cached_page_id) return pages[cached_page_index];
 
                 PageIndex page = try_get_page_index(page_id);
-                if (!page.is_insert_point)
+                cached_page_id = page_id;
+                if (!page.is_insert_point) {
+                    cached_page_index = page.pos;
                     return pages[page.pos];
+                }
 
                 page.pos++;
                 const auto& it = pages.emplace(pages.begin() + page.pos, Page{std::allocator<PageMember>{}.allocate(S), page_id});
                 for (uint32_t i = 0; i < S; i++)
                     it->data[i].entity = null;
+                cached_page_index = page.pos;
                 return pages[page.pos];
             }
 
