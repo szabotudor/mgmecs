@@ -141,7 +141,7 @@ namespace mgm {
 
         private:
         template<typename Type, size_t S = 256>
-        class PackedMapWithSparseSearch {
+        class PagedBinarySearchMap {
             struct PageMember {
                 Type value;
                 Entity entity = null;
@@ -181,8 +181,8 @@ namespace mgm {
 
                 const PageIndex page = try_get_page_index(page_id);
                 if (!page.is_insert_point) {
-                    const_cast<PackedMapWithSparseSearch<Type, S>*>(this)->cached_page_id = page_id;
-                    const_cast<PackedMapWithSparseSearch<Type, S>*>(this)->cached_page_index = page.pos;
+                    const_cast<PagedBinarySearchMap<Type, S>*>(this)->cached_page_id = page_id;
+                    const_cast<PagedBinarySearchMap<Type, S>*>(this)->cached_page_index = page.pos;
                     return const_cast<Page&>(pages[page.pos]);
                 }
 
@@ -207,21 +207,21 @@ namespace mgm {
             }
 
             public:
-            PackedMapWithSparseSearch(const PackedMapWithSparseSearch<Type, S>&) = delete;
-            PackedMapWithSparseSearch(PackedMapWithSparseSearch<Type, S>&& pm) {
+            PagedBinarySearchMap(const PagedBinarySearchMap<Type, S>&) = delete;
+            PagedBinarySearchMap(PagedBinarySearchMap<Type, S>&& pm) {
                 if (this == &pm)
                     return;
                 pages = std::move(pm.pages);
             }
-            PackedMapWithSparseSearch<Type, S>& operator=(const PackedMapWithSparseSearch<Type, S>&) = delete;
-            PackedMapWithSparseSearch<Type, S>& operator=(PackedMapWithSparseSearch<Type, S>&& pm) {
+            PagedBinarySearchMap<Type, S>& operator=(const PagedBinarySearchMap<Type, S>&) = delete;
+            PagedBinarySearchMap<Type, S>& operator=(PagedBinarySearchMap<Type, S>&& pm) {
                 if (this == &pm)
                     return *this;
                 pages = std::move(pm.pages);
                 return *this;
             }
 
-            PackedMapWithSparseSearch() {
+            PagedBinarySearchMap() {
                 const auto& page = pages.emplace_back(Page{std::allocator<PageMember>{}.allocate(S), 0});
                 for (uint32_t i = 0; i < S; i++)
                     page.data[i].entity = null;
@@ -281,7 +281,7 @@ namespace mgm {
                 component.entity = null;
             }
 
-            ~PackedMapWithSparseSearch() {
+            ~PagedBinarySearchMap() {
                 for (auto& page : pages) {
                     for (uint32_t i = 0; i < S; i++) {
                         if (page.data[i].entity != null) {
@@ -310,8 +310,8 @@ namespace mgm {
             std::function<void(ComponentPool& pool)> free{};
 
             template<typename T>
-            PackedMapWithSparseSearch<T>& map() const {
-                return *reinterpret_cast<PackedMapWithSparseSearch<T>*>(data);
+            PagedBinarySearchMap<T>& map() const {
+                return *reinterpret_cast<PagedBinarySearchMap<T>*>(data);
             }
 
             ~ComponentPool() {
@@ -319,7 +319,7 @@ namespace mgm {
             }
         };
         template<typename T>
-        PackedMapWithSparseSearch<T>& get_or_create_type_pool_map() {
+        PagedBinarySearchMap<T>& get_or_create_type_pool_map() {
             auto it = type_pools.find(type_id<T>);
             if (it != type_pools.end())
                 return it->second.template map<T>();
@@ -328,12 +328,12 @@ namespace mgm {
             return pool.template map<T>();
         }
         template<typename T>
-        PackedMapWithSparseSearch<T>& get_type_pool_map() const {
+        PagedBinarySearchMap<T>& get_type_pool_map() const {
             auto it = type_pools.find(type_id<T>);
             if (it == type_pools.end())
                 throw std::runtime_error("Tried to access unregistered type");
             const ComponentPool& pool = it->second;
-            return const_cast<PackedMapWithSparseSearch<T>&>(pool.template map<T>());
+            return const_cast<PagedBinarySearchMap<T>&>(pool.template map<T>());
         }
         std::unordered_map<uint32_t, ComponentPool> type_pools{};
 
@@ -344,11 +344,11 @@ namespace mgm {
         ComponentPool& create_type_pool() {
             ComponentPool& pool = type_pools[type_id<T>];
 
-            pool.data = new PackedMapWithSparseSearch<T>;
+            pool.data = new PagedBinarySearchMap<T>;
             pool.remove = [](ComponentPool& pool, const Entity entity) { pool.template map<T>().destroy(entity); };
             pool.try_remove = [](ComponentPool& pool, const Entity entity) { pool.template map<T>().try_destroy(entity); };
             pool.has = [](const ComponentPool& pool, const Entity entity) { return pool.template map<T>().try_get(entity) != nullptr; };
-            pool.free = [](ComponentPool& pool) { delete static_cast<PackedMapWithSparseSearch<T>*>(pool.data); };
+            pool.free = [](ComponentPool& pool) { delete static_cast<PagedBinarySearchMap<T>*>(pool.data); };
             return pool;
         }
 
@@ -492,7 +492,7 @@ namespace mgm {
          */
         template<typename T>
         T& get(const Entity entity) const {
-            const PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
+            const PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
             return map.get(entity);
         }
 
@@ -541,7 +541,7 @@ namespace mgm {
             if (entities[entity].flags & EntityFlag_TOOMBSTONE)
                 return nullptr;
 
-            const PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
+            const PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
             return const_cast<T*>(map.try_get(entity));
         }
         
@@ -553,7 +553,7 @@ namespace mgm {
          */
         template<typename T>
         void remove(const Entity entity) {
-            PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
+            PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
             map.destroy(entity);
         }
 
@@ -567,7 +567,7 @@ namespace mgm {
         template<typename T, typename It,
             std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
         void remove(const It& begin, const It& end) {
-            PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
+            PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
             for (auto e = begin; e != end; e++)
                 map.destroy(*e);
         }
@@ -583,7 +583,7 @@ namespace mgm {
             if (entities[entity].flags & EntityFlag_TOOMBSTONE)
                 return;
 
-            PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
+            PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
             map.try_destroy(entity);
         }
 
@@ -597,7 +597,7 @@ namespace mgm {
         template<typename T, typename It,
             std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
         void try_remove(const It& begin, const It& end) {
-            PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
+            PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
             for (auto e = begin; e != end; e++) {
                 if (this->entities[*e].flags & EntityFlag_TOOMBSTONE)
                     continue;
