@@ -1,3 +1,4 @@
+#include "entt/entity/fwd.hpp"
 #include "mgmecs.hpp"
 #include <cstdint>
 #include <iostream>
@@ -26,7 +27,7 @@ struct TestInt {
 auto test_mgmecs(const uint32_t num_ents) {
     auto start = std::chrono::high_resolution_clock::now();
     mgm::MgmEcs ecs{};
-    std::vector<mgm::EntityType> ents;
+    std::vector<mgm::EntityType> ents{};
     ents.resize(num_ents);
     ecs.create(ents.begin(), ents.end());
     int i = 467831;
@@ -35,9 +36,7 @@ auto test_mgmecs(const uint32_t num_ents) {
         i ^= (i << 7) ^ (i >> 13) ^ (i << 8);
     }
 
-    for (const auto& e : ents) {
-        ecs.remove<TestInt>(e);
-    }
+    ecs.remove<TestInt>(ents.begin(), ents.end());
 
     return std::chrono::high_resolution_clock::now() - start;
 }
