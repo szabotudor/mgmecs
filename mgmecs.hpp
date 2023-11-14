@@ -1,98 +1,23 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <iterator>
 #include <memory.h>
 #include <functional>
+#include <type_traits>
 #include <unordered_map>
 #include <stdexcept>
 #include <vector>
 
 
 namespace mgm {
-    using Entity = uint32_t;
-    using Component = uint32_t;
-    constexpr Entity null = (Entity)-1;
-    constexpr Component null_component = (Component)-1;
-    constexpr uint32_t null_type_id = (uint32_t)-1;
+    using EntityType = uint32_t;
+    using ComponentType = uint32_t;
 
-    struct EntityReference {
-        private:
-        friend class MgmEcs;
-
-        EntityReference(const class MgmEcs& ecs, const Entity entity) : num_refs{new uint32_t{1}}, ecs{&ecs}, entity{entity} {}
-
-        public:
-        EntityReference() = default;
-
-        EntityReference(const EntityReference& cr) : num_refs{cr.num_refs}, ecs{cr.ecs}, entity{cr.entity} {
-            ++*num_refs;
-        }
-        EntityReference(EntityReference&& cr) : num_refs{cr.num_refs}, ecs{cr.ecs}, entity{cr.entity} {
-            memset(&cr, 0, sizeof(EntityReference));
-        }
-        EntityReference& operator=(const EntityReference& cr) {
-            if (this == &cr)
-                return *this;
-            memcpy(this, &cr, sizeof(EntityReference));
-            ++*num_refs;
-            return *this;
-        }
-        EntityReference& operator=(EntityReference&& cr) {
-            if (this == &cr)
-                return *this;
-            memcpy(this, &cr, sizeof(EntityReference));
-            memset(&cr, 0, sizeof(EntityReference));
-            return *this;
-        }
-
-        uint32_t* num_refs = nullptr;
-        const MgmEcs* ecs = nullptr;
-        Entity entity = null;
-
-        bool is_valid() const { return ecs != nullptr; }
-        template<typename T> const T& get() const;
-        void destroy_original();
-
-        void invalidate() {
-            if (num_refs == nullptr)
-                return;
-
-            --*num_refs;
-            if (*num_refs == 0)
-                delete num_refs;
-
-            num_refs = nullptr;
-            ecs = nullptr;
-            entity = null;
-        }
-
-        ~EntityReference() {
-            invalidate();
-        }
-    };
-    struct ComponentReference : public EntityReference {
-        private:
-        friend class MgmEcs;
-        using EntityReference::EntityReference;
-
-        ComponentReference(const class MgmEcs& ecs, const Entity entity, const uint32_t type_id) {
-            num_refs = new uint32_t{1};
-            this->ecs = &ecs;
-            this->entity = entity;
-            this->type_id = type_id;
-        }
-
-        public:
-        uint32_t type_id = null;
-
-        template<typename T> const T& get() const;
-        void destroy_original();
-
-        ~ComponentReference() {
-            invalidate();
-        }
-    };
-
+    template<typename Entity = EntityType, typename Component = ComponentType,
+        std::enable_if_t<std::is_integral_v<EntityType>, bool> = true,
+        std::enable_if_t<std::is_integral_v<ComponentType>, bool> = true
+    >
     class MgmEcs {
         friend class EntityReference;
         friend class ComponentReference;
@@ -105,6 +30,114 @@ namespace mgm {
          * @tparam T The type to get the ID of
          */
         template<typename T> static inline const uint32_t type_id = _num_types++;
+
+        static constexpr Entity null = (Entity)-1;
+        static constexpr Component null_component = (Component)-1;
+        static constexpr uint32_t null_type_id = (uint32_t)-1;
+
+
+        struct EntityReference {
+            private:
+            friend class MgmEcs<Entity, Component>;
+            EntityReference(const MgmEcs& ecs, const Entity entity) : num_refs{new uint32_t{1}}, ecs{&ecs}, entity{entity} {}
+
+            public:
+            EntityReference() = default;
+
+            EntityReference(const EntityReference& cr) : num_refs{cr.num_refs}, ecs{cr.ecs}, entity{cr.entity} {
+                ++*num_refs;
+            }
+            EntityReference(EntityReference&& cr) : num_refs{cr.num_refs}, ecs{cr.ecs}, entity{cr.entity} {
+                memset(&cr, 0, sizeof(EntityReference));
+            }
+            EntityReference& operator=(const EntityReference& cr) {
+                if (this == &cr)
+                    return *this;
+                memcpy(this, &cr, sizeof(EntityReference));
+                ++*num_refs;
+                return *this;
+            }
+            EntityReference& operator=(EntityReference&& cr) {
+                if (this == &cr)
+                    return *this;
+                memcpy(this, &cr, sizeof(EntityReference));
+                memset(&cr, 0, sizeof(EntityReference));
+                return *this;
+            }
+
+            uint32_t* num_refs = nullptr;
+            const MgmEcs* ecs = nullptr;
+            Entity entity = null;
+
+            bool is_valid() const { return ecs != nullptr; }
+            template<typename T> const T& get() const {
+                if (ecs == nullptr)
+                    throw std::runtime_error("Invalid reference, or wrong type");
+                const auto& map = ecs->get_type_pool_map<T>();
+                return map.get(entity);
+            }
+            void destroy_original() {
+                if (ecs == nullptr)
+                    throw std::runtime_error("Invalid reference");
+                if (*num_refs > 1)
+                    throw std::runtime_error("Other references are using this entity, so it cannot be destroyed");
+                const_cast<MgmEcs*>(ecs)->destroy(entity);
+                invalidate();
+            }
+
+            void invalidate() {
+                if (num_refs == nullptr)
+                    return;
+
+                --*num_refs;
+                if (*num_refs == 0)
+                    delete num_refs;
+
+                num_refs = nullptr;
+                ecs = nullptr;
+                entity = null;
+            }
+
+            ~EntityReference() {
+                invalidate();
+            }
+        };
+        struct ComponentReference : public EntityReference {
+            private:
+            friend class MgmEcs<Entity, Component>;
+            using EntityReference::EntityReference;
+
+            ComponentReference(const MgmEcs& ecs, const Entity entity, const uint32_t type_id) {
+                this->num_refs = new uint32_t{1};
+                this->ecs = &ecs;
+                this->entity = entity;
+                this->type_id = type_id;
+            }
+
+            public:
+            uint32_t type_id = null;
+
+            template<typename T> const T& get() const {
+                if (this->ecs == nullptr || type_id != MgmEcs::type_id<T>)
+                    throw std::runtime_error("Invalid reference, or wrong type");
+                const auto& map = this->ecs->template get_type_pool_map<T>();
+                return map.get(this->entity);
+            }
+            void destroy_original() {
+                if (this->ecs == nullptr)
+                    throw std::runtime_error("Invalid reference");
+                if (*this->num_refs > 1)
+                    throw std::runtime_error("Other references are using this component, so it cannot be destroyed");
+                MgmEcs::ComponentPool& type_pool = const_cast<MgmEcs*>(this->ecs)->type_pools[type_id];
+                type_pool.remove(type_pool, this->entity);
+                this->invalidate();
+            }
+
+            ~ComponentReference() {
+                this->invalidate();
+            }
+        };
+
 
         private:
         template<typename Type, size_t S = 256>
@@ -285,7 +318,7 @@ namespace mgm {
                 return it->second.template map<T>();
 
             ComponentPool& pool = create_type_pool<T>();
-            return pool.map<T>();
+            return pool.template map<T>();
         }
         template<typename T>
         PackedMapWithSparseSearch<T>& get_type_pool_map() const {
@@ -293,7 +326,7 @@ namespace mgm {
             if (it == type_pools.end())
                 throw std::runtime_error("Tried to access unregistered type");
             const ComponentPool& pool = it->second;
-            return const_cast<PackedMapWithSparseSearch<T>&>(pool.map<T>());
+            return const_cast<PackedMapWithSparseSearch<T>&>(pool.template map<T>());
         }
         std::unordered_map<uint32_t, ComponentPool> type_pools{};
 
@@ -305,9 +338,9 @@ namespace mgm {
             ComponentPool& pool = type_pools[type_id<T>];
 
             pool.data = new PackedMapWithSparseSearch<T>;
-            pool.remove = [](ComponentPool& pool, const Entity entity) { pool.map<T>().destroy(entity); };
-            pool.try_remove = [](ComponentPool& pool, const Entity entity) { pool.map<T>().try_destroy(entity); };
-            pool.has = [](const ComponentPool& pool, const Entity entity) { return pool.map<T>().try_get(entity) != nullptr; };
+            pool.remove = [](ComponentPool& pool, const Entity entity) { pool.template map<T>().destroy(entity); };
+            pool.try_remove = [](ComponentPool& pool, const Entity entity) { pool.template map<T>().try_destroy(entity); };
+            pool.has = [](const ComponentPool& pool, const Entity entity) { return pool.template map<T>().try_get(entity) != nullptr; };
             pool.free = [](ComponentPool& pool) { delete static_cast<PackedMapWithSparseSearch<T>*>(pool.data); };
             return pool;
         }
@@ -342,38 +375,34 @@ namespace mgm {
          * @param num How many entities to create
          * @return A vector with the IDs of the entities
          */
-        std::vector<Entity> create(const uint32_t num) {
-            std::vector<Entity> new_entity_ids{};
-            new_entity_ids.reserve(num);
-
+        template<typename It,
+            std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
+        void create(const It& begin, const It& end) {
+            const auto num_create = end - begin;
             if (available_entities.empty()) {
-                Entity num_entities = (Entity)entities.size();
-                entities.resize(entities.size() + num);
-                for (auto e = entities.end() - num; e != entities.end(); e++) {
-                    auto& e_id = *e;
-                    e_id = EntityInfo{};
-                    new_entity_ids.emplace_back(num_entities++);
-                }
+                auto num_entities = entities.size();
+                entities.resize(num_entities + num_create);
+                for (auto e = begin; e != end; e++)
+                    *e = num_entities++;
             }
-            else if (num <= available_entities.size()) {
-                for (auto e = available_entities.end() - num; e != available_entities.end(); e++) {
-                    const auto& e_id = *e;
-                    new_entity_ids.emplace_back(e_id);
-                    entities[e_id] = EntityInfo{};
+            else if (available_entities.size() >= num_create) {
+                for (auto e = begin; e != end; e++) {
+                    *e = available_entities.back();
+                    available_entities.pop_back();
+                    entities[*e] = EntityInfo{};
                 }
-                available_entities.erase(available_entities.end() - num, available_entities.end());
             }
             else {
-                for (const auto& e_id : available_entities) {
-                    new_entity_ids.emplace_back(e_id);
-                    entities[e_id] = EntityInfo{};
+                for (auto e = begin; e != end; e++) {
+                    *e = available_entities.back();
+                    available_entities.pop_back();
+                    entities[*e] = EntityInfo{};
+                    if (available_entities.empty()) {
+                        create(e, end);
+                        break;
+                    }
                 }
-                const size_t remaining_entities = num - available_entities.size();
-                available_entities.clear();
-                const auto next_new_entity_ids = create(remaining_entities);
-                new_entity_ids.insert(new_entity_ids.end(), next_new_entity_ids.begin(), next_new_entity_ids.end());
             }
-            return new_entity_ids;
         }
 
         /**
@@ -384,20 +413,6 @@ namespace mgm {
          */
         EntityReference entity_reference(const Entity entity) const {
             return EntityReference{*this, entity};
-        }
-
-        /**
-         * @brief Get all entities
-         * 
-         * @return A vector with all entities
-         */
-        std::vector<Entity> all() const {
-            std::vector<Entity> res{};
-            res.reserve(entities.size());
-            for (Entity i = 0; i < entities.size(); i++)
-                if (!(entities[i].flags & EntityFlag_TOOMBSTONE))
-                    res.emplace_back(i);
-            return res;
         }
 
         /**
@@ -419,14 +434,17 @@ namespace mgm {
         /**
          * @brief Destroy a number of entities
          * 
-         * @param entities A vector with all entity IDs to destroy
+         * @param begin An iterator to the beginning of the list of entities
+         * @param end An iterator to the end of the list of entities
          */
-        void destroy(const std::vector<Entity> entities) {
-            for (const auto& e : entities) {
+        template<typename It,
+            std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
+        void destroy(const It& begin, const It& end) {
+            for (auto e = begin; e != end; e++) {
                 for (auto& [tid, type_pool] : type_pools)
-                    type_pool.try_remove(type_pool, e);
-                this->entities[e].flags = EntityFlag_TOOMBSTONE;
-                available_entities.push_back(e);
+                    type_pool.remove(type_pool, *e);
+                this->entities[*e].flags = EntityFlag_TOOMBSTONE;
+                available_entities.push_back(*e);
             }
         }
 
@@ -441,6 +459,21 @@ namespace mgm {
         template<typename T, typename... Ts>
         T& emplace(const Entity entity, Ts&&... args) {
             return get_or_create_type_pool_map<T>().emplace(entity, args...);
+        }
+
+        /**
+         * @brief Register a component for each entity in a list of entities, and call a constructor with the given arguments
+         * 
+         * @param begin An iterator to the beginning of the list of entities
+         * @param end An iterator to the end of the list of entities
+         * @param args Constructor arguments
+         */
+        template<typename T, typename It, typename... Ts,
+            std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
+        void emplace(const It& begin, const It& end, Ts&&... args) {
+            auto& map = get_or_create_type_pool_map<T>();
+            for (auto e = begin; e < end; e++)
+                map.emplace(*e, args...);
         }
 
         /**
@@ -521,13 +554,15 @@ namespace mgm {
          * @brief Remove a component from a number of entities
          * 
          * @tparam T The type of component to remove
-         * @param entities A vector with all entities to remove the component from
+         * @param begin An iterator to the beginning of the list of entities
+         * @param end An iterator to the end of the list of entities
          */
-        template<typename T>
-        void remove(const std::vector<Entity>& entities) {
+        template<typename T, typename It,
+            std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
+        void remove(const It& begin, const It& end) {
             PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
-            for (const auto& e : entities)
-                map.destroy(e);
+            for (auto e = begin; e != end; e++)
+                map.destroy(*e);
         }
 
         /**
@@ -549,56 +584,22 @@ namespace mgm {
          * @brief Remove a component from a number of entities and call its destructor, if it exists on that entity
          * 
          * @tparam T The type of component to remove
-         * @param entities A vector containing the IDs of the entities to remove the component from
+         * @param begin An iterator to the beginning of the list of entities
+         * @param end An iterator to the end of the list of entities
          */
-        template<typename T>
-        void try_remove(const std::vector<Entity>& entities) {
+        template<typename T, typename It,
+            std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
+        void try_remove(const It& begin, const It& end) {
             PackedMapWithSparseSearch<T>& map = get_type_pool_map<T>();
-            for (const auto& e : entities) {
-                if (this->entities[e].flags & EntityFlag_TOOMBSTONE)
+            for (auto e = begin; e != end; e++) {
+                if (this->entities[*e].flags & EntityFlag_TOOMBSTONE)
                     continue;
 
-                map.try_destroy(e);
+                map.try_destroy(*e);
             }
         }
 
         ~MgmEcs() {
-            destroy(all());
         }
     };
-
-    template<typename T>
-    const T& EntityReference::get() const {
-        if (ecs == nullptr)
-            throw std::runtime_error("Invalid reference, or wrong type");
-        const auto& map = ecs->get_type_pool_map<T>();
-        return map.get(entity);
-    }
-
-    inline void EntityReference::destroy_original() {
-        if (ecs == nullptr)
-            throw std::runtime_error("Invalid reference");
-        if (*num_refs > 1)
-            throw std::runtime_error("Other references are using this entity, so it cannot be destroyed");
-        const_cast<MgmEcs*>(ecs)->destroy(entity);
-        invalidate();
-    }
-
-    template<typename T>
-    const T& ComponentReference::get() const {
-        if (ecs == nullptr || type_id != MgmEcs::type_id<T>)
-            throw std::runtime_error("Invalid reference, or wrong type");
-        const auto& map = ecs->get_type_pool_map<T>();
-        return map.get(entity);
-    }
-
-    inline void ComponentReference::destroy_original() {
-        if (ecs == nullptr)
-            throw std::runtime_error("Invalid reference");
-        if (*num_refs > 1)
-            throw std::runtime_error("Other references are using this component, so it cannot be destroyed");
-        MgmEcs::ComponentPool& type_pool = const_cast<MgmEcs*>(ecs)->type_pools[type_id];
-        type_pool.remove(type_pool, entity);
-        invalidate();
-    }
 }
