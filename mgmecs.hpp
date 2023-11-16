@@ -11,13 +11,25 @@
 
 
 namespace mgm {
-    using EntityType = uint32_t;
-    using ComponentType = uint32_t;
+    using Entity = uint32_t;
+    using Component = uint32_t;
 
-    template<typename Entity = EntityType, typename Component = ComponentType,
-        std::enable_if_t<std::is_integral_v<EntityType>, bool> = true,
-        std::enable_if_t<std::is_integral_v<ComponentType>, bool> = true
-    >
+    template<typename, typename = void>
+    constexpr bool has_callback_emplace = false;
+    template<typename T>
+    constexpr bool has_callback_emplace<T, std::void_t<decltype(&T::on_emplace)>> = true;
+
+    template<typename, typename = void>
+    constexpr bool has_callback_access = false;
+    template<typename T>
+    constexpr bool has_callback_access<T, std::void_t<decltype(&T::on_access)>> = true;
+
+    template<typename, typename = void>
+    constexpr bool has_callback_remove = false;
+    template<typename T>
+    constexpr bool has_callback_remove<T, std::void_t<decltype(&T::on_remove)>> = true;
+
+
     class MgmEcs {
         friend class EntityReference;
         friend class ComponentReference;
@@ -38,7 +50,7 @@ namespace mgm {
 
         struct EntityReference {
             private:
-            friend class MgmEcs<Entity, Component>;
+            friend class MgmEcs;
             EntityReference(const MgmEcs& ecs, const Entity entity) : num_refs{new uint32_t{1}}, ecs{&ecs}, entity{entity} {}
 
             public:
@@ -104,7 +116,7 @@ namespace mgm {
         };
         struct ComponentReference : public EntityReference {
             private:
-            friend class MgmEcs<Entity, Component>;
+            friend class MgmEcs;
             using EntityReference::EntityReference;
 
             ComponentReference(const MgmEcs& ecs, const Entity entity, const uint32_t type_id) {
@@ -294,6 +306,7 @@ namespace mgm {
             }
         };
 
+
         enum EntityFlags {
             EntityFlag_NONE = 0x0,
             EntityFlag_TOOMBSTONE = 0x1 << 0
@@ -465,7 +478,10 @@ namespace mgm {
          */
         template<typename T, typename... Ts>
         T& emplace(const Entity entity, Ts&&... args) {
-            return get_or_create_type_pool_map<T>().emplace(entity, args...);
+            auto& res = get_or_create_type_pool_map<T>().emplace(entity, args...);
+            if constexpr (has_callback_emplace<T>)
+                res.on_emplace(*this, entity);
+            return res;
         }
 
         /**
@@ -479,8 +495,12 @@ namespace mgm {
             std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
         void emplace(const It& begin, const It& end, Ts&&... args) {
             auto& map = get_or_create_type_pool_map<T>();
-            for (auto e = begin; e < end; e++)
-                map.emplace(*e, args...);
+            for (auto e = begin; e < end; e++) {
+                if constexpr (has_callback_emplace<T>)
+                    map.emplace(*e, args...).on_emplace(*this, *e);
+                else
+                    map.emplace(*e, args...);
+            }
         }
 
         /**
@@ -493,7 +513,10 @@ namespace mgm {
         template<typename T>
         T& get(const Entity entity) const {
             const PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
-            return map.get(entity);
+            auto& res = map.get(entity);
+            if constexpr (has_callback_access<T>)
+                res.on_access(*this, entity);
+            return res;
         }
 
         /**
@@ -526,7 +549,21 @@ namespace mgm {
          */
         template<typename T, typename... Ts>
         T& get_or_emplace(const Entity entity, Ts&&... args) {
-            return get_or_create_type_pool_map<T>().get_or_emplace(entity, args...);
+            if constexpr (has_callback_emplace<T> || has_callback_access<T>) {
+                PagedBinarySearchMap<T>& map = get_or_create_type_pool_map<T>();
+                T* res = map.try_get(entity);
+                if (res != nullptr) {
+                    if constexpr (has_callback_access<T>)
+                        res->on_access(*this, entity);
+                    return res;
+                }
+                res = &map.emplace(entity, args...);
+                if constexpr (has_callback_emplace<T>)
+                    res->on_emplace(*this, entity);
+                return res;
+            }
+            else
+                return get_or_create_type_pool_map<T>().get_or_emplace(entity, args...);
         }
 
         /**
@@ -542,7 +579,10 @@ namespace mgm {
                 return nullptr;
 
             const PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
-            return const_cast<T*>(map.try_get(entity));
+            T* res = const_cast<T*>(map.try_get(entity));
+            if constexpr (has_callback_access<T>)
+                res->on_access(*this, entity);
+            return *res;
         }
         
         /**
@@ -554,6 +594,8 @@ namespace mgm {
         template<typename T>
         void remove(const Entity entity) {
             PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
+            if constexpr (has_callback_remove<T>)
+                map.get(entity).on_remove(*this, entity);
             map.destroy(entity);
         }
 
@@ -568,8 +610,11 @@ namespace mgm {
             std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
         void remove(const It& begin, const It& end) {
             PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
-            for (auto e = begin; e != end; e++)
+            for (auto e = begin; e != end; e++) {
+                if constexpr (has_callback_remove<T>)
+                    map.get(*e).on_remove(*this, *e);
                 map.destroy(*e);
+            }
         }
 
         /**
@@ -584,6 +629,8 @@ namespace mgm {
                 return;
 
             PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
+            if constexpr (has_callback_remove<T>)
+                map.get(entity).on_remove(*this, entity);
             map.try_destroy(entity);
         }
 
@@ -602,6 +649,8 @@ namespace mgm {
                 if (this->entities[*e].flags & EntityFlag_TOOMBSTONE)
                     continue;
 
+                if constexpr (has_callback_remove<T>)
+                    map.get(*e).on_remove(*this, *e);
                 map.try_destroy(*e);
             }
         }
