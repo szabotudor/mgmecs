@@ -141,7 +141,7 @@ namespace mgm {
                 if (*this->num_refs > 1)
                     throw std::runtime_error("Other references are using this component, so it cannot be destroyed");
                 MgmEcs::ComponentPool& type_pool = const_cast<MgmEcs*>(this->ecs)->type_pools[type_id];
-                type_pool.remove(type_pool, this->entity);
+                type_pool.remove(*const_cast<MgmEcs*>(ecs), this->entity);
                 this->invalidate();
             }
 
@@ -317,9 +317,9 @@ namespace mgm {
         struct ComponentPool {
             void* data = nullptr;
 
-            std::function<void(ComponentPool&, const Entity)> remove{};
-            std::function<void(ComponentPool&, const Entity)> try_remove{};
-            std::function<bool(const ComponentPool&, const Entity)> has{};
+            std::function<void(MgmEcs&, const Entity)> remove{};
+            std::function<void(MgmEcs&, const Entity)> try_remove{};
+            std::function<bool(const MgmEcs&, const Entity)> has{};
             std::function<void(ComponentPool& pool)> free{};
 
             template<typename T>
@@ -358,9 +358,9 @@ namespace mgm {
             ComponentPool& pool = type_pools[type_id<T>];
 
             pool.data = new PagedBinarySearchMap<T>;
-            pool.remove = [](ComponentPool& pool, const Entity entity) { pool.template map<T>().destroy(entity); };
-            pool.try_remove = [](ComponentPool& pool, const Entity entity) { pool.template map<T>().try_destroy(entity); };
-            pool.has = [](const ComponentPool& pool, const Entity entity) { return pool.template map<T>().try_get(entity) != nullptr; };
+            pool.remove = [](MgmEcs& ecs, const Entity entity) { ecs.remove<T>(entity); };
+            pool.try_remove = [](MgmEcs& ecs, const Entity entity) { ecs.try_remove<T>(entity); };
+            pool.has = [](const MgmEcs& ecs, const Entity entity) { return ecs.try_get<T>(entity) != nullptr; };
             pool.free = [](ComponentPool& pool) { delete static_cast<PagedBinarySearchMap<T>*>(pool.data); };
             return pool;
         }
@@ -446,7 +446,7 @@ namespace mgm {
 
             auto components = get_all(entity);
             for (auto& type_pool : type_pools)
-                type_pool.second.remove(type_pool.second, entity);
+                type_pool.second.remove(*this, entity);
             entities[entity].flags = EntityFlag_TOOMBSTONE;
             available_entities.push_back(entity);
         }
@@ -462,7 +462,7 @@ namespace mgm {
         void destroy(const It& begin, const It& end) {
             for (auto e = begin; e != end; e++) {
                 for (auto& [tid, type_pool] : type_pools)
-                    type_pool.remove(type_pool, *e);
+                    type_pool.remove(*this, *e);
                 this->entities[*e].flags = EntityFlag_TOOMBSTONE;
                 available_entities.push_back(*e);
             }
@@ -531,7 +531,7 @@ namespace mgm {
 
             std::vector<ComponentReference> components{};
             for (const auto& [type_id, type_pool] : type_pools) {
-                if (!type_pool.has(type_pool, entity))
+                if (!type_pool.has(*this, entity))
                     continue;
                 ComponentReference cr{*this, entity, type_id};
                 components.emplace_back(std::move(cr));
@@ -582,7 +582,7 @@ namespace mgm {
             T* res = const_cast<T*>(map.try_get(entity));
             if constexpr (has_callback_access<T>)
                 res->on_access(*this, entity);
-            return *res;
+            return res;
         }
         
         /**
