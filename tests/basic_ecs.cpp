@@ -27,7 +27,7 @@ struct TestInt {
 auto test_mgmecs(const uint32_t num_ents) {
     auto start = std::chrono::high_resolution_clock::now();
     mgm::MgmEcs ecs{};
-    std::vector<mgm::EntityType> ents{};
+    std::vector<mgm::Entity> ents{};
     ents.resize(num_ents);
     ecs.create(ents.begin(), ents.end());
     int i = 467831;
@@ -61,7 +61,7 @@ int main() {
 
     mgm::MgmEcs ecs{};
     std::cout << "\nTesting creating a number of entities" << std::endl;
-    std::vector<mgm::EntityType> ents;
+    std::vector<mgm::Entity> ents;
     ents.resize(100);
     ecs.create(ents.begin(), ents.end());
     uint32_t i = 0;
@@ -77,9 +77,9 @@ int main() {
     ecs.emplace<int>(1, 69);
     const auto refs = ecs.get_all(1);
     for (const auto& ct : refs) {
-        if (ct.type_id == mgm::MgmEcs<>::type_id<int>)
+        if (ct.type_id == mgm::MgmEcs::type_id<int>)
             std::cout << "This is an int: " << ct.get<int>();
-        else if (ct.type_id == mgm::MgmEcs<>::type_id<uint32_t>)
+        else if (ct.type_id == mgm::MgmEcs::type_id<uint32_t>)
             std::cout << "This is a uint32_t: " << ct.get<uint32_t>();
         std::cout << std::endl;
     }
