@@ -30,13 +30,13 @@ auto test_mgmecs(const uint32_t num_ents) {
     std::vector<mgm::Entity> ents{};
     ents.resize(num_ents);
     ecs.create(ents.begin(), ents.end());
+    ecs.emplace<int>(ents.begin(), ents.end());
     int i = 467831;
-    for (const auto& e : ents) {
-        ecs.emplace<TestInt>(e, i);
-        i ^= (i << 7) ^ (i >> 13) ^ (i << 8);
+    for (const auto& e : ecs.group<int>()) {
+        ecs.get<int>(e) =  i ^= (i << 7) ^ (i >> 13) ^ (i << 8);
     }
 
-    ecs.remove<TestInt>(ents.begin(), ents.end());
+    ecs.remove<int>(ents.begin(), ents.end());
 
     return std::chrono::high_resolution_clock::now() - start;
 }
@@ -74,7 +74,6 @@ int main() {
     ecs.destroy(ents.begin(), ents.end());
 
     std::cout << "\nTesting component references" << std::endl;
-    ecs.emplace<int>(1, 69);
     const auto refs = ecs.get_all(1);
     for (const auto& ct : refs) {
         if (ct.type_id == mgm::MgmEcs::type_id<int>)
@@ -83,6 +82,19 @@ int main() {
             std::cout << "This is a uint32_t: " << ct.get<uint32_t>();
         std::cout << std::endl;
     }
+
+    std::cout << "\nTesting looping through a group (should not contain entities 1, 5, 6, 31, 95, 96, 97):\n";
+    ecs.emplace<int>(1, 69);
+    ecs.emplace<int>(5, 32);
+    ecs.emplace<int>(6, 58347);
+    ecs.emplace<int>(31, 3);
+    ecs.emplace<int>(97);
+    ecs.emplace<int>(96);
+    ecs.emplace<int>(95);
+    for (const auto& e : ecs.group<uint32_t>({}, mgm::TypeList<int>{})) {
+        std::cout << e << ' ';
+    }
+    std::cout << std::endl;
 
     std::cout << "\nCausing an intentional crash..." << std::endl;
     try {
