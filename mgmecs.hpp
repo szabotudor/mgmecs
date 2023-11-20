@@ -13,6 +13,9 @@
 namespace mgm {
     using Entity = uint32_t;
     using Component = uint32_t;
+    static constexpr Entity null = (Entity)-1;
+    static constexpr Component null_component = (Component)-1;
+    static constexpr uint32_t null_type_id = (uint32_t)-1;
 
     template<typename, typename = void>
     constexpr bool has_callback_emplace = false;
@@ -30,6 +33,126 @@ namespace mgm {
     constexpr bool has_callback_remove<T, std::void_t<decltype(&T::on_remove)>> = true;
 
 
+    template<typename... Ts>
+    struct TypeList {
+        static constexpr uint32_t num_types = sizeof...(Ts);
+
+        template<uint32_t i, std::enable_if_t<(i < num_types), bool> = true>
+        static constexpr auto get_at() {
+            if constexpr (i == 0)
+                return _First<TypeList<Ts...>>{};
+            else
+                return typename _First<TypeList<Ts...>>::Remaining{}.template get_at<i - 1>();
+        }
+
+        template<uint32_t i, std::enable_if_t<(i < num_types), bool> = true>
+        static constexpr auto get_until() {
+            if constexpr (i == 0)
+                return TypeList<typename _First<TypeList<Ts...>>::Type>{};
+            else
+                return typename decltype(get_until<i - 1>())::template Append<TypeAt<i>>{};
+        }
+
+        template<uint32_t i, std::enable_if_t<(i < num_types), bool> = true>
+        static constexpr auto get_after_including_current() {
+            if constexpr (i == num_types - 1)
+                return TypeList<TypeAt<i>>{};
+            else
+                return typename decltype(get_after_including_current<i + 1>())::template Prepend<TypeAt<i>>{};
+        }
+
+        template<uint32_t i = num_types - 1>
+        static constexpr size_t size() {
+            if constexpr (sizeof...(Ts) == 0)
+                return 0;
+            else if constexpr (i == 0)
+                return sizeof(typename _First<TypeList<Ts...>>::Type);
+            else
+                return sizeof(typename _First<TypeList<Ts...>>::Type) + typename _First<TypeList<Ts...>>::Remaining{}.template size<i - 1>();
+        }
+
+        template<typename T>
+        struct _First;
+        template<typename T, typename... Us>
+        struct _First<TypeList<T, Us...>> {
+            using Type = T;
+            using Remaining = TypeList<Us...>;
+        };
+
+        template<uint32_t i>
+        using TypeAt = decltype(get_at<i>())::Type;
+
+        template<typename T>
+        using Append = TypeList<Ts..., T>;
+
+        template<typename T>
+        using Prepend = TypeList<T, Ts...>;
+
+        template<typename T>
+        struct _Concat;
+        template<typename... Us>
+        struct _Concat<TypeList<Us...>> {
+            using Result = TypeList<Ts..., Us...>;
+        };
+        template<typename T>
+        using Concat = _Concat<T>::Result;
+
+        template<uint32_t i>
+        using TypesUntil = decltype(get_until<i>());
+
+        template<uint32_t i>
+        using TypesAfter = decltype(get_after_including_current<i + 1>());
+    };
+
+    template<typename T>
+    struct TypeListContainer;
+
+    template<typename... Ts>
+    struct TypeListContainer<TypeList<Ts...>> {
+        uint8_t data[TypeList<Ts...>::size()]{};
+
+        private:
+        template<uint32_t i = 0>
+        void initialize() {
+            using T = TypeList<Ts...>::template TypeAt<i>;
+            new (&get<i>()) T{};
+            if constexpr (i < TypeList<Ts...>::num_types - 1)
+                initialize<i + 1>();
+        }
+
+        public:
+        TypeListContainer() {
+            initialize();
+        }
+
+        template<uint32_t i>
+        auto& get() {
+            using FirstList = decltype(TypeList<Ts...>{}.template get_at<i>());
+            using First = typename FirstList::Type;
+            return *reinterpret_cast<First*>(&data[TypeList<Ts...>{}.size() - typename FirstList::Remaining{}.size() - sizeof(First)]);
+        }
+
+        template<uint32_t i>
+        const auto& get() const {
+            return const_cast<TypeListContainer*>(this)->get<i>();
+        }
+
+        private:
+        template<uint32_t i = 0>
+        void destruct() {
+            using T = TypeList<Ts...>::template TypeAt<i>;
+            get<i>().~T();
+            if constexpr (i < TypeList<Ts...>::num_types - 1)
+                destruct<i + 1>();
+        }
+
+        public:
+        ~TypeListContainer() {
+            destruct();
+        }
+    };
+
+
     class MgmEcs {
         friend class EntityReference;
         friend class ComponentReference;
@@ -42,10 +165,6 @@ namespace mgm {
          * @tparam T The type to get the ID of
          */
         template<typename T> static inline const uint32_t type_id = _num_types++;
-
-        static constexpr Entity null = (Entity)-1;
-        static constexpr Component null_component = (Component)-1;
-        static constexpr uint32_t null_type_id = (uint32_t)-1;
 
 
         struct EntityReference {
@@ -154,12 +273,47 @@ namespace mgm {
         private:
         template<typename Type, size_t S = 256>
         class PagedBinarySearchMap {
+            public:
+            struct Iterator {
+                friend class PagedBinarySearchMap<Type>;
+                const PagedBinarySearchMap<Type>* map = nullptr;
+                uint32_t page = 0;
+                uint32_t pos = 0;
+
+                Iterator() = delete;
+
+                private:
+                Iterator(const PagedBinarySearchMap<Type>& map, const uint32_t page, const uint32_t pos) : map{&map}, page{page}, pos{pos} {}
+
+                public:
+                Iterator operator++() {
+                    if (pos == map->pages[page].num)
+                        return *this;
+                    ++pos;
+                    if (map->pages.size() > page + 1) {
+                        ++page;
+                        pos = 0;
+                    }
+                    return *this;
+                }
+                bool operator==(const Iterator& it) const { return map == it.map && page == it.page && pos == it.pos; }
+                bool operator!=(const Iterator& it) const { return map != it.map && page != it.page && pos != it.pos; }
+                Entity operator*() const {
+                    if (map->pages[page].num < pos)
+                        return null;
+                    return map->pages[page].data[pos].entity;
+                }
+            };
+
+            private:
             struct PageMember {
                 Type value;
                 Entity entity = null;
             };
             struct Page {
+                Component* map = nullptr;
                 PageMember* data = nullptr;
+                Component num = 0;
                 uint32_t id = 0;
             };
             std::vector<Page> pages{};
@@ -167,8 +321,8 @@ namespace mgm {
             uint32_t cached_page_index = 0;
 
             struct PageIndex {
-                bool is_insert_point = false;
-                uint32_t pos = 0;
+                uint32_t pos : (sizeof(uint32_t) * 8 - 1) = 0;
+                bool is_insert_point : 1 = false;
             };
             PageIndex try_get_page_index(const uint32_t page_id) const {
                 uint32_t i = pages.size() / 2;
@@ -184,9 +338,9 @@ namespace mgm {
                         i = (i + right + 1) / 2;
                     }
                     else if (pages[i].id == page_id)
-                        return PageIndex{ false, i };
+                        return PageIndex{ i, false };
                 } while (right - left > 1);
-                return PageIndex{ pages[left].id != page_id, left };
+                return PageIndex{ left, pages[left].id != page_id };
             }
             Page& get_page(const uint32_t page_id) const {
                 if (page_id == cached_page_id) return const_cast<Page&>(pages[cached_page_index]);
@@ -211,9 +365,11 @@ namespace mgm {
                 }
 
                 page.pos++;
-                const auto& it = pages.emplace(pages.begin() + page.pos, Page{std::allocator<PageMember>{}.allocate(S), page_id});
-                for (uint32_t i = 0; i < S; i++)
+                const auto& it = pages.emplace(pages.begin() + page.pos, Page{new Component[S], std::allocator<PageMember>{}.allocate(S), 0, page_id});
+                for (uint32_t i = 0; i < S; i++) {
                     it->data[i].entity = null;
+                    it->map[i] = null_component;
+                }
                 cached_page_index = page.pos;
                 return pages[page.pos];
             }
@@ -234,68 +390,95 @@ namespace mgm {
             }
 
             PagedBinarySearchMap() {
-                const auto& page = pages.emplace_back(Page{std::allocator<PageMember>{}.allocate(S), 0});
-                for (uint32_t i = 0; i < S; i++)
+                const Page& page = pages.emplace_back(Page{new Component[S], std::allocator<PageMember>{}.allocate(S), 0, 0});
+                for (uint32_t i = 0; i < S; i++) {
                     page.data[i].entity = null;
+                    page.map[i] = null_component;
+                }
             }
 
             template<typename... Ts>
             Type& emplace(const Entity entity, Ts&&... args) {
-                PageMember& component = get_or_create_page(entity / S).data[entity % S];
-                if (component.entity != null)
+                Page& page = get_or_create_page(entity / S);
+                Component& component = page.map[entity % S];
+                if (component != null_component)
                     throw std::runtime_error("Entity already exists");
-                memset(&component, 0, sizeof(PageMember));
-                new (&component.value) Type{args...};
-                component.entity = entity;
-                return component.value;
+                component = page.num++;
+                new (&page.data[component].value) Type{args...};
+                page.data[component].entity = entity;
+                return page.data[component].value;
             }
 
             template<typename... Ts>
             Type& get_or_emplace(const Entity entity, Ts&&... args) {
-                PageMember& component = get_or_create_page(entity / S).data[entity % S];
-                if (component.entity != null)
-                    return component.value;
-                memset(&component, 0, sizeof(PageMember));
-                new (&component.value) Type{args...};
-                component.entity = entity;
-                return component.value;
+                Page& page = get_or_create_page(entity / S);
+                Component& component = page.map[entity % S];
+                if (component == null_component) {
+                    component = page.num++;
+                    new (&page.data[component].value) Type{args...};
+                    page.data[component].entity = entity;
+                }
+                return page.data[component].value;
             }
 
             Type& get(const Entity entity) const {
-                const PageMember& component = get_page(entity / S).data[entity % S];
-                if (component.entity == null)
+                const Page& page = get_page(entity / S);
+                const Component& component = page.map[entity % S];
+                if (component == null_component)
                     throw std::runtime_error("Entity doesn't exist, or isn't registered for this component type");
-                return *const_cast<Type*>(&component.value);
+                return *const_cast<Type*>(&page.data[component].value);
             }
 
             Type* try_get(const Entity entity) const {
                 const PageIndex page_index = try_get_page_index(entity / S);
                 if (page_index.is_insert_point)
                     return nullptr;
-                const PageMember& component = pages[page_index.pos].data[entity % S];
-                if (component.entity == null)
+                const Page& page = pages[page_index.pos];
+                const Component& component = page.map[entity % S];
+                if (component == null_component)
                     return nullptr;
-                return const_cast<Type*>(&component.value);
+                return const_cast<Type*>(&page.data[component].value);
+            }
+
+            bool has(const Entity entity) const {
+                const PageIndex page_index = try_get_page_index(entity / S);
+                if (page_index.is_insert_point)
+                    return false;
+                return pages[page_index.pos].map[entity % S] != null_component;
             }
 
             void destroy(const Entity entity) {
-                PageMember& component = get_page(entity / S).data[entity % S];
-                if (component.entity == null)
+                Page& page = get_page(entity / S);
+                Component& component = page.map[entity % S];
+                if (component == null_component)
                     throw std::runtime_error("Entity doesn't exist, or isn't registered for this component type");
-                component.value.~Type();
-                component.entity = null;
+                std::swap(page.data[component], page.data[--page.num]);
+                page.map[page.data[component].entity % S] = component;
+                page.data[page.num].value.~Type();
+                page.data[page.num].entity = null;
+                component = null_component;
             }
             void try_destroy(Entity entity) {
-                PageMember& component = get_page(entity / S).data[entity % S];
-                if (component.entity == null)
+                const PageIndex& page_index = try_get_page_index(entity / S);
+                if (page_index.is_insert_point)
                     return;
-                component.value.~Type();
-                component.entity = null;
+                Page& page = pages[page_index.pos];
+                Component& component = page.map[entity % S];
+                if (component == null_component)
+                    return;
+                std::swap(page.data[component], page.data[--page.num]);
+                page.map[page.data[component].entity % S] = component;
+                page.data[page.num].value.~Type();
+                page.data[page.num].entity = null;
+                component = null_component;
             }
+
+            Iterator begin() const { return Iterator{*this, 0, 0}; }
+            Iterator end() const { return Iterator{*this, (uint32_t)(pages.size() - 1), pages.back().num }; }
 
             ~PagedBinarySearchMap() {
                 for (auto& page : pages) {
-                    for (uint32_t i = 0; i < S; i++) {
+                    for (uint32_t i = 0; i < page.num; i++) {
                         if (page.data[i].entity != null) {
                             page.data[i].value.~Type();
                             memset(&page.data[i].value, 0, sizeof(S));
@@ -389,6 +572,10 @@ namespace mgm {
             return entity;
         }
 
+        bool is_toombstone(const Entity entity) {
+            return (bool)(entities[entity].flags & EntityFlag_TOOMBSTONE);
+        }
+
         /**
          * @brief Create a number of entities
          * 
@@ -466,6 +653,88 @@ namespace mgm {
                 this->entities[*e].flags = EntityFlag_TOOMBSTONE;
                 available_entities.push_back(*e);
             }
+        }
+
+        template<typename T, typename U>
+        struct Group;
+
+        template<typename... Ts, typename... Us>
+        struct Group<TypeList<Ts...>, TypeList<Us...>> {
+            friend class MgmEcs;
+            using IncludeTypes = TypeList<Ts...>;
+            using ExcludeTypes = TypeList<Us...>;
+            using MainType = IncludeTypes::template TypeAt<0>;
+
+            struct Iterator : std::iterator_traits<Entity> {
+                friend class Group<TypeList<Ts...>, TypeList<Us...>>;
+
+                const MgmEcs* ecs;
+                PagedBinarySearchMap<MainType>::Iterator current;
+
+                Iterator() = default;
+
+                private:
+                Iterator(const MgmEcs& ecs, const PagedBinarySearchMap<MainType>::Iterator& it) : ecs{&ecs}, current{it} {}
+
+                template<typename T>
+                bool _valid() const {
+                    if constexpr (T::num_types > 1) {
+                        if (ecs->has<typename T::template TypeAt<0>>(*current))
+                            return _valid<T::template TypesAfter<0>>();
+                        else
+                            return false;
+                    }
+                    else
+                        return ecs->has<typename T::template TypeAt<0>>(*current);
+                }
+
+                public:
+                bool valid() const {
+                    if constexpr (IncludeTypes::num_types > 1) {
+                        if constexpr(ExcludeTypes::num_types)
+                            return _valid<typename IncludeTypes::template TypesAfter<0>>() && !_valid<TypeList<Us...>>();
+                        else
+                            return _valid<typename IncludeTypes::template TypesAfter<0>>();
+                    }
+                    else {
+                        if constexpr(ExcludeTypes::num_types)
+                            return !_valid<TypeList<Us...>>();
+                        else
+                            return true;
+                    }
+                }
+                Iterator operator++() {
+                    do
+                        ++current;
+                    while (!valid() && *current != null);
+                    return *this;
+                }
+                bool operator==(const Iterator& it) const { return ecs == it.ecs && current == it.current; }
+                bool operator!=(const Iterator& it) const { return !(*this == it); }
+                Entity operator*() const { return *current; }
+            };
+
+            const MgmEcs* ecs;
+
+            private:
+            Iterator _begin;
+            Iterator _end;
+
+            Group(const MgmEcs& ecs) : ecs{&ecs}, _begin{ecs, ecs.get_type_pool_map<MainType>().begin()}, _end{ecs, ecs.get_type_pool_map<MainType>().end()} {}
+
+            public:
+            Group() = delete;
+
+            auto begin() const { return _begin; }
+            auto end() const { return _end; }
+
+            template<typename T>
+            Group(const PagedBinarySearchMap<T>::Iterator& begin, const PagedBinarySearchMap<T>::Iterator& end) {};
+        };
+
+        template<typename T, typename... Ts, typename... Us>
+        auto group(const TypeList<T, Ts...>& include = TypeList<T, Ts...>{}, const TypeList<Us...>& exclude = TypeList<Us...>{}) const {
+            return Group<TypeList<T, Ts...>, TypeList<Us...>>{*this};
         }
 
         /**
@@ -585,6 +854,11 @@ namespace mgm {
             return res;
         }
         
+        template<typename T>
+        bool has(const Entity entity) const {
+            return get_type_pool_map<T>().has(entity);
+        }
+
         /**
          * @brief Remove a component from an entity and call its destructor
          * 
