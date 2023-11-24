@@ -1,4 +1,3 @@
-#include "entt/entity/fwd.hpp"
 #include "mgmecs.hpp"
 #include <cstdint>
 #include <iostream>
@@ -22,6 +21,14 @@ struct TestInt {
 
     TestInt(const int v) : value{v} {}
     ~TestInt() = default;
+
+    void on_emplace(mgm::MgmEcs& ecs, const mgm::Entity entity) {
+        std::cout << "Emplaced " << entity << ' ' << value << std::endl;
+    }
+
+    void on_remove(mgm::MgmEcs& ecs, const mgm::Entity entity) {
+        std::cout << "Removing " << entity << ' ' << value << std::endl;
+    }
 };
 
 auto test_mgmecs(const uint32_t num_ents) {
@@ -45,7 +52,6 @@ auto test_mgmecs(const uint32_t num_ents) {
 int main() {
     constexpr uint32_t num_iterations = 10000;
     constexpr uint32_t num_entities = 4000;
-    std::cout << "Creation and destruction time test: " << num_iterations << " iterations of " << num_entities << " entities..." << std::endl;
 
     {
         for (int i = 0; i < num_iterations / 10; i++) {
@@ -60,7 +66,11 @@ int main() {
     }
 
     mgm::MgmEcs ecs{};
-    std::cout << "\nTesting creating a number of entities" << std::endl;
+    std::cout << "\nTesting callbacks" << std::endl;
+    ecs.emplace<TestInt>(ecs.create(), 10);
+    ecs.destroy(0);
+
+    std::cout << "\nTesting creating a number of entities and erasing them" << std::endl;
     std::vector<mgm::Entity> ents;
     ents.resize(100);
     ecs.create(ents.begin(), ents.end());
