@@ -17,20 +17,22 @@ namespace mgm {
     static constexpr Component null_component = (Component)-1;
     static constexpr uint32_t null_type_id = (uint32_t)-1;
 
+    class MgmEcs;
+
     template<typename, typename = void>
     constexpr bool has_callback_emplace = false;
     template<typename T>
-    constexpr bool has_callback_emplace<T, std::void_t<decltype(&T::on_emplace)>> = true;
+    constexpr bool has_callback_emplace<T, std::void_t<std::enable_if<std::is_same_v<void (T::*)(MgmEcs& ecs, Entity entity), decltype(&T::on_emplace)>>>> = true;
 
     template<typename, typename = void>
     constexpr bool has_callback_access = false;
     template<typename T>
-    constexpr bool has_callback_access<T, std::void_t<decltype(&T::on_access)>> = true;
+    constexpr bool has_callback_access<T, std::void_t<std::enable_if<std::is_same_v<void (T::*)(MgmEcs& ecs, Entity entity), decltype(&T::on_access)>>>> = true;
 
     template<typename, typename = void>
     constexpr bool has_callback_remove = false;
     template<typename T>
-    constexpr bool has_callback_remove<T, std::void_t<decltype(&T::on_remove)>> = true;
+    constexpr bool has_callback_remove<T, std::void_t<std::enable_if<std::is_same_v<void (T::*)(MgmEcs& ecs, Entity entity), decltype(&T::on_remove)>>>> = true;
 
 
     template<typename... Ts>
@@ -287,19 +289,19 @@ namespace mgm {
 
                 public:
                 Iterator operator++() {
-                    if (pos == map->pages[page].num)
+                    if (page == map->pages.size())
                         return *this;
                     ++pos;
-                    if (map->pages.size() > page + 1) {
+                    if (pos == map->pages[page].num) {
                         ++page;
                         pos = 0;
                     }
                     return *this;
                 }
                 bool operator==(const Iterator& it) const { return map == it.map && page == it.page && pos == it.pos; }
-                bool operator!=(const Iterator& it) const { return map != it.map && page != it.page && pos != it.pos; }
+                bool operator!=(const Iterator& it) const { return !(*this == it); }
                 Entity operator*() const {
-                    if (map->pages[page].num < pos)
+                    if (page == map->pages.size())
                         return null;
                     return map->pages[page].data[pos].entity;
                 }
@@ -474,7 +476,7 @@ namespace mgm {
             }
 
             Iterator begin() const { return Iterator{*this, 0, 0}; }
-            Iterator end() const { return Iterator{*this, (uint32_t)(pages.size() - 1), pages.back().num }; }
+            Iterator end() const { return Iterator{*this, (uint32_t)(pages.size()), 0 }; }
 
             ~PagedBinarySearchMap() {
                 for (auto& page : pages) {
@@ -605,7 +607,7 @@ namespace mgm {
                     available_entities.pop_back();
                     entities[*e] = EntityInfo{};
                     if (available_entities.empty()) {
-                        create(e, end);
+                        create(e + 1, end);
                         break;
                     }
                 }
@@ -633,7 +635,7 @@ namespace mgm {
 
             auto components = get_all(entity);
             for (auto& type_pool : type_pools)
-                type_pool.second.remove(*this, entity);
+                type_pool.second.try_remove(*this, entity);
             entities[entity].flags = EntityFlag_TOOMBSTONE;
             available_entities.push_back(entity);
         }
@@ -649,7 +651,7 @@ namespace mgm {
         void destroy(const It& begin, const It& end) {
             for (auto e = begin; e != end; e++) {
                 for (auto& [tid, type_pool] : type_pools)
-                    type_pool.remove(*this, *e);
+                    type_pool.try_remove(*this, *e);
                 this->entities[*e].flags = EntityFlag_TOOMBSTONE;
                 available_entities.push_back(*e);
             }
@@ -903,9 +905,15 @@ namespace mgm {
                 return;
 
             PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
-            if constexpr (has_callback_remove<T>)
-                map.get(entity).on_remove(*this, entity);
-            map.try_destroy(entity);
+            if constexpr (has_callback_remove<T>) {
+                auto ent = map.try_get(entity);
+                if (ent != nullptr) {
+                    map.get(entity).on_remove(*this, entity);
+                    map.destroy(entity);
+                }
+            }
+            else
+                map.try_destroy(entity);
         }
 
         /**
@@ -923,10 +931,16 @@ namespace mgm {
                 if (this->entities[*e].flags & EntityFlag_TOOMBSTONE)
                     continue;
 
-                if constexpr (has_callback_remove<T>)
-                    map.get(*e).on_remove(*this, *e);
-                map.try_destroy(*e);
-            }
+                if constexpr (has_callback_remove<T>) {
+                    auto ent = map.try_get(*e);
+                    if (ent != nullptr) {
+                        map.get(*e).on_remove(*this, *e);
+                        map.destroy(*e);
+                    }
+                }
+                else
+                    map.try_destroy(*e);
+                }
         }
 
         ~MgmEcs() {
