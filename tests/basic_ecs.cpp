@@ -106,6 +106,11 @@ int main() {
     }
     std::cout << std::endl;
 
+    std::cout << "\nTesting looping through a group (should contain entities 1, 5, 6, 31, 95, 96, 97):\n";
+    for (const auto& e : ecs.group<int, int>()) {
+        std::cout << e << ' ';
+    }
+
     std::cout << "\nCausing an intentional crash..." << std::endl;
     try {
         std::cout << "Getting an int reference to an int component... " << refs[ecs.type_id<int>].get<int>() << std::endl;

@@ -22,17 +22,17 @@ namespace mgm {
     template<typename, typename = void>
     constexpr bool has_callback_emplace = false;
     template<typename T>
-    constexpr bool has_callback_emplace<T, std::void_t<std::enable_if<std::is_same_v<void (T::*)(MgmEcs& ecs, Entity entity), decltype(&T::on_emplace)>>>> = true;
+    inline constexpr bool has_callback_emplace<T, std::void_t<std::enable_if<std::is_same_v<void (T::*)(MgmEcs& ecs, Entity entity), decltype(&T::on_emplace)>>>> = true;
 
     template<typename, typename = void>
     constexpr bool has_callback_access = false;
     template<typename T>
-    constexpr bool has_callback_access<T, std::void_t<std::enable_if<std::is_same_v<void (T::*)(MgmEcs& ecs, Entity entity), decltype(&T::on_access)>>>> = true;
+    inline constexpr bool has_callback_access<T, std::void_t<std::enable_if<std::is_same_v<void (T::*)(MgmEcs& ecs, Entity entity), decltype(&T::on_access)>>>> = true;
 
     template<typename, typename = void>
     constexpr bool has_callback_remove = false;
     template<typename T>
-    constexpr bool has_callback_remove<T, std::void_t<std::enable_if<std::is_same_v<void (T::*)(MgmEcs& ecs, Entity entity), decltype(&T::on_remove)>>>> = true;
+    inline constexpr bool has_callback_remove<T, std::void_t<std::enable_if<std::is_same_v<void (T::*)(MgmEcs& ecs, Entity entity), decltype(&T::on_remove)>>>> = true;
 
 
     template<typename... Ts>
@@ -82,7 +82,7 @@ namespace mgm {
         };
 
         template<uint32_t i>
-        using TypeAt = decltype(get_at<i>())::Type;
+        using TypeAt = typename decltype(get_at<i>())::Type;
 
         template<typename T>
         using Append = TypeList<Ts..., T>;
@@ -97,7 +97,7 @@ namespace mgm {
             using Result = TypeList<Ts..., Us...>;
         };
         template<typename T>
-        using Concat = _Concat<T>::Result;
+        using Concat = typename _Concat<T>::Result;
 
         template<uint32_t i>
         using TypesUntil = decltype(get_until<i>());
@@ -116,7 +116,7 @@ namespace mgm {
         private:
         template<uint32_t i = 0>
         void initialize() {
-            using T = TypeList<Ts...>::template TypeAt<i>;
+            using T = typename TypeList<Ts...>::template TypeAt<i>;
             new (&get<i>()) T{};
             if constexpr (i < TypeList<Ts...>::num_types - 1)
                 initialize<i + 1>();
@@ -142,7 +142,7 @@ namespace mgm {
         private:
         template<uint32_t i = 0>
         void destruct() {
-            using T = TypeList<Ts...>::template TypeAt<i>;
+            using T = typename TypeList<Ts...>::template TypeAt<i>;
             get<i>().~T();
             if constexpr (i < TypeList<Ts...>::num_types - 1)
                 destruct<i + 1>();
@@ -585,7 +585,7 @@ namespace mgm {
          * @return A vector with the IDs of the entities
          */
         template<typename It,
-            std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
+            typename std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
         void create(const It& begin, const It& end) {
             const auto num_create = end - begin;
             if (available_entities.empty()) {
@@ -647,7 +647,7 @@ namespace mgm {
          * @param end An iterator to the end of the list of entities
          */
         template<typename It,
-            std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
+            typename std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
         void destroy(const It& begin, const It& end) {
             for (auto e = begin; e != end; e++) {
                 for (auto& [tid, type_pool] : type_pools)
@@ -665,18 +665,18 @@ namespace mgm {
             friend class MgmEcs;
             using IncludeTypes = TypeList<Ts...>;
             using ExcludeTypes = TypeList<Us...>;
-            using MainType = IncludeTypes::template TypeAt<0>;
+            using MainType = typename IncludeTypes::template TypeAt<0>;
 
             struct Iterator : std::iterator_traits<Entity> {
                 friend class Group<TypeList<Ts...>, TypeList<Us...>>;
 
                 const MgmEcs* ecs;
-                PagedBinarySearchMap<MainType>::Iterator current;
+                typename PagedBinarySearchMap<MainType>::Iterator current;
 
                 Iterator() = default;
 
                 private:
-                Iterator(const MgmEcs& ecs, const PagedBinarySearchMap<MainType>::Iterator& it) : ecs{&ecs}, current{it} {}
+                Iterator(const MgmEcs& ecs, const typename PagedBinarySearchMap<MainType>::Iterator& it) : ecs{&ecs}, current{it} {}
 
                 template<typename T>
                 bool _valid() const {
@@ -731,7 +731,7 @@ namespace mgm {
             auto end() const { return _end; }
 
             template<typename T>
-            Group(const PagedBinarySearchMap<T>::Iterator& begin, const PagedBinarySearchMap<T>::Iterator& end) {};
+            Group(const typename PagedBinarySearchMap<T>::Iterator& begin, const typename PagedBinarySearchMap<T>::Iterator& end) {};
         };
 
         template<typename T, typename... Ts, typename... Us>
@@ -763,7 +763,7 @@ namespace mgm {
          * @param args Constructor arguments
          */
         template<typename T, typename It, typename... Ts,
-            std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
+            typename std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
         void emplace(const It& begin, const It& end, Ts&&... args) {
             auto& map = get_or_create_type_pool_map<T>();
             for (auto e = begin; e < end; e++) {
@@ -883,7 +883,7 @@ namespace mgm {
          * @param end An iterator to the end of the list of entities
          */
         template<typename T, typename It,
-            std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
+            typename std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
         void remove(const It& begin, const It& end) {
             PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
             for (auto e = begin; e != end; e++) {
@@ -924,7 +924,7 @@ namespace mgm {
          * @param end An iterator to the end of the list of entities
          */
         template<typename T, typename It,
-            std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
+            typename std::iterator_traits<It>::iterator_category = typename std::iterator_traits<It>::iterator_category{}>
         void try_remove(const It& begin, const It& end) {
             PagedBinarySearchMap<T>& map = get_type_pool_map<T>();
             for (auto e = begin; e != end; e++) {
