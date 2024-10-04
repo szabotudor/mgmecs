@@ -819,7 +819,6 @@ namespace mgm {
                     ++pos;
                 return Iterator{this, pos};
             }
-            // this, ecs->template get_container<T>().template get<T>().components.size()
             Iterator end() const { return Iterator{nullptr, 0}; }
 
             ~Group() {
