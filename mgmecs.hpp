@@ -1,16 +1,14 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
-#include <any>
 #include <functional>
-#include <limits>
 #include <queue>
 #include <stdexcept>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <vector>
+#include <mutex>
+#include <condition_variable>
 
 
 namespace mgm {
@@ -30,6 +28,8 @@ namespace mgm {
     template<typename EntityType = uint32_t, bool safety = true>
     class MGMecs {
         using Ecs = MGMecs<EntityType, safety>;
+
+        mutable std::recursive_mutex mutex{};
 
         template<typename T>
         struct TypeHash {
@@ -86,54 +86,142 @@ namespace mgm {
 
         template<typename T>
         struct ComponentBucket {
-            using CompBucket = ComponentBucket<T>;
+            mutable std::recursive_mutex mutex{};
+
             std::vector<T> components{};
             std::vector<Entity> original{};
             std::unordered_map<Entity, size_t, typename Entity::Hash> map{};
+
+            struct ThreadSafeSet {
+                std::unordered_set<size_t> set{};
+                std::mutex mutex{};
+                std::condition_variable cv{};
+
+                void insert(size_t e) {
+                    std::unique_lock lock{mutex};
+                    set.insert(e);
+                    cv.notify_all();
+                }
+                void erase(size_t e) {
+                    std::unique_lock lock{mutex};
+                    set.erase(e);
+                    cv.notify_all();
+                }
+                bool contains(size_t e) {
+                    std::unique_lock lock{mutex};
+                    return set.find(e) != set.end();
+                }
+                void wait_without_lock_on(size_t e) {
+                    std::unique_lock lock{mutex};
+                    cv.wait(lock, [this, e] { return set.find(e) != set.end(); });
+                }
+                void lock_on(size_t e) {
+                    std::unique_lock lock{mutex};
+                    if (set.find(e) != set.end())
+                        cv.wait(lock, [this, e] { return set.find(e) != set.end(); });
+                    set.insert(e);
+                }
+                void clear() {
+                    std::unique_lock lock{mutex};
+                    set.clear();
+                    cv.notify_all();
+                }
+                ~ThreadSafeSet() = default;
+            } busy_components{};
+            
             std::unordered_set<GroupContainer*> iterating_groups{};
+
+            ComponentBucket() = default;
+
+            bool empty() const {
+                std::unique_lock lock{mutex};
+                return components.empty();
+            }
 
             template<typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
             T& create(Ecs* ecs, const Entity e, Ts&&... args) {
+                std::unique_lock lock{mutex};
                 if constexpr (safety)
                     if (map.find(e) != map.end())
                         throw std::runtime_error("Entity already contains a component of this type");
                 map.emplace(e, components.size());
                 original.emplace_back(e);
                 T& component = components.emplace_back(std::forward<Ts>(args)...);
-
+                const auto c = components.size() - 1;
                 if constexpr (HAS_CONSTRUCT)
                     if (ecs != nullptr)
+                        busy_components.insert(c);
+
+                lock.unlock();
+
+                if constexpr (HAS_CONSTRUCT) {
+                    if (ecs != nullptr) {
                         component.on_construct(ecs, e);
+                        busy_components.erase(c);
+                    }
+                }
 
                 return component;
             }
 
             template<typename It, typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
             void create(Ecs* ecs, const It& begin, const It& end, Ts&&... args) {
-                const auto start = components.size();
+                std::vector<std::pair<T*, size_t>> constructed{};
+                constructed.reserve(std::distance(begin, end));
 
-                for (auto it = begin; it != end; ++it)
-                    create(nullptr, *it, std::forward<Ts>(args)...);
+                std::unique_lock lock{mutex};
 
-                if constexpr (HAS_CONSTRUCT)
-                    if (ecs != nullptr)
-                        for (auto i = start; i < components.size(); i++)
-                            components[i].on_construct(ecs, original[i]);
+                for (auto it = begin; it != end; ++it) {
+                    if constexpr (safety)
+                        if (map.find(*it) != map.end())
+                            throw std::runtime_error("Entity already contains a component of this type");
+                    map.emplace(*it, components.size());
+                    original.emplace_back(*it);
+                    constructed.emplace_back(&components.emplace_back(std::forward<Ts>(args)...), components.size() - 1);
+                    busy_components.insert(components.size() - 1);
+                }
+
+                lock.unlock();
+
+                if constexpr (HAS_CONSTRUCT) {
+                    if (ecs != nullptr) {
+                        for (const auto& [component, c] : constructed) {
+                            component->on_construct(ecs, original[c]);
+                            busy_components.erase(c);
+                        }
+                    }
+                }
             }
             template<typename It, typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
             void try_create(Ecs* ecs, const It& begin, const It& end, Ts&&... args) {
-                const auto start = components.size();
+                std::vector<std::pair<T*, size_t>> constructed{};
+                constructed.reserve(std::distance(begin, end));
 
-                for (auto it = begin; it != end; ++it)
-                    get_or_create(nullptr, *it, std::forward<Ts>(args)...);
+                std::unique_lock lock{mutex};
 
-                if constexpr (HAS_CONSTRUCT)
-                    if (ecs != nullptr)
-                        for (auto i = start; i < components.size(); i++)
-                            components[i].on_construct(ecs, original[i]);
+                for (auto it = begin; it != end; ++it) {
+                    if (map.find(*it) != map.end())
+                        continue;
+                    map.emplace(*it, components.size());
+                    original.emplace_back(*it);
+                    constructed.emplace_back(&components.emplace_back(std::forward<Ts>(args)...), components.size() - 1);
+                    busy_components.insert(components.size() - 1);
+                }
+
+                lock.unlock();
+                
+                if constexpr (HAS_CONSTRUCT) {
+                    if (ecs != nullptr) {
+                        for (const auto& [component, c] : constructed) {
+                            component->on_construct(ecs, original[c]);
+                            busy_components.erase(c);
+                        }
+                    }
+                }
             }
 
             const T& get(const Entity e) const {
+                std::unique_lock lock{mutex};
                 if constexpr (safety) {
                     const auto it = map.find(e);
                     if (it == map.end())
@@ -146,29 +234,31 @@ namespace mgm {
                 }
             }
             T& get(const Entity e) {
-                const T& val = const_cast<const CompBucket*>(this)->get(e);
+                std::unique_lock lock{mutex};
+                const T& val = const_cast<const ComponentBucket<T>*>(this)->get(e);
                 return const_cast<T&>(val);
             }
 
             template<typename ... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
             T& get_or_create(Ecs* ecs, const Entity e, Ts&&... args) {
+                std::unique_lock lock{mutex};
                 const auto it = map.find(e);
                 if (it == map.end()) {
-                    T& component = create(ecs, e, std::forward<Ts>(args)...);
-
-                    return component;
+                    lock.unlock();
+                    return create(ecs, e, std::forward<Ts>(args)...);
                 }
                 return components[it->second];
             }
 
             const T* try_get(const Entity e) const {
+                std::unique_lock lock{mutex};
                 const auto it = map.find(e);
                 if (it == map.end())
                     return nullptr;
                 return &components[it->second];
             }
             T* try_get(const Entity e) {
-                const T* val = const_cast<const CompBucket*>(this)->try_get(e);
+                const T* val = const_cast<const ComponentBucket<T>*>(this)->try_get(e);
                 return const_cast<T*>(val);
             }
 
@@ -195,31 +285,47 @@ namespace mgm {
 
         public:
             void destroy(Ecs* ecs, const Entity e) {
+                std::unique_lock lock{mutex};
                 const auto it = map.find(e);
                 if constexpr (safety)
                     if (it == map.end())
                         throw std::runtime_error("Entity doesn't contain a component of this type");
 
+                busy_components.lock_on(it->second);
+                lock.unlock();
+
                 const auto c = it->second;
 
-                if constexpr (HAS_DESTROY)
-                    if (ecs != nullptr)
+                if constexpr (HAS_DESTROY) {
+                    if (ecs != nullptr) {
                         components[c].on_destroy(ecs, e);
+                        busy_components.erase(c);
+                    }
+                }
 
+                lock.lock();
                 map.erase(it);
                 __destroy(c);
             }
             bool try_destroy(Ecs* ecs, const Entity e) {
+                std::unique_lock lock{mutex};
                 const auto it = map.find(e);
                 if (it == map.end())
                     return false;
 
+                busy_components.lock_on(it->second);
+                lock.unlock();
+
                 const auto c = it->second;
 
-                if constexpr (HAS_DESTROY)
-                    if (ecs != nullptr)
+                if constexpr (HAS_DESTROY) {
+                    if (ecs != nullptr) {
                         components[c].on_destroy(ecs, e);
+                        busy_components.erase(c);
+                    }
+                }
 
+                lock.lock();
                 map.erase(it);
                 return __destroy(c);
             }
@@ -260,19 +366,29 @@ namespace mgm {
                 std::vector<typename decltype(map)::iterator> to_remove;
                 to_remove.reserve(std::distance(begin, end));
 
+                std::unique_lock lock{mutex};
+
                 for (auto it = begin; it != end; ++it) {
                     const auto entity_it = map.find(*it);
                     if constexpr (safety)
                         if (entity_it == map.end())
                             throw std::runtime_error("Entity doesn't contain a component of this type");
+                    busy_components.lock_on(entity_it->second);
                     to_remove.push_back(entity_it);
                 }
 
-                if constexpr (HAS_DESTROY)
-                    if (ecs != nullptr)
-                        for (const auto& it : to_remove)
-                            components[it->second].on_destroy(ecs, it->first);
+                lock.unlock();
 
+                if constexpr (HAS_DESTROY) {
+                    if (ecs != nullptr) {
+                        for (const auto& it : to_remove) {
+                            components[it->second].on_destroy(ecs, it->first);
+                            busy_components.erase(it->second);
+                        }
+                    }
+                }
+
+                lock.lock();
                 for (const auto& it : to_remove)
                     map.erase(it);
 
@@ -286,17 +402,28 @@ namespace mgm {
                 std::vector<typename decltype(map)::iterator> to_remove;
                 to_remove.reserve(std::distance(begin, end));
 
+                std::unique_lock lock{mutex};
+
                 for (auto it = begin; it != end; ++it) {
                     const auto entity_it = map.find(*it);
-                    if (entity_it != map.end())
+                    if (entity_it != map.end()) {
+                        busy_components.lock_on(entity_it->second);
                         to_remove.push_back(entity_it);
+                    }
                 }
 
-                if constexpr (HAS_DESTROY)
-                    if (ecs != nullptr)
-                        for (const auto& it : to_remove)
-                            components[it->second].on_destroy(ecs, it->first);
+                lock.unlock();
 
+                if constexpr (HAS_DESTROY) {
+                    if (ecs != nullptr) {
+                        for (const auto& it : to_remove) {
+                            components[it->second].on_destroy(ecs, it->first);
+                            busy_components.erase(it->second);
+                        }
+                    }
+                }
+
+                lock.lock();
                 for (const auto& it : to_remove)
                     map.erase(it);
 
@@ -304,31 +431,59 @@ namespace mgm {
             }
 
             void destroy_all(Ecs* ecs) {
-                if constexpr (HAS_DESTROY) {
-                    const auto original_copy = original;
-                    destroy(ecs, original_copy.begin(), original_copy.end());
-                }
+                const auto original_copy = original;
+                destroy(ecs, original_copy.begin(), original_copy.end());
             }
         };
 
         struct Container {
-            std::any bucket{};
+            struct Any {
+                void* value = nullptr;
+                std::function<void(void*)> destructor = nullptr;
+                
+                template<typename T, typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
+                void emplace(Ts&&... args) {
+                    value = new T(std::forward<Ts>(args)...);
+                    destructor = [](void* ptr) { delete static_cast<T*>(ptr); };
+                }
+
+                template<typename T>
+                T& get() {
+                    return *static_cast<T*>(value);
+                }
+                template<typename T>
+                const T& get() const {
+                    return *static_cast<T*>(value);
+                }
+
+                void destroy() {
+                    if (destructor != nullptr)
+                        destructor(value);
+                    value = nullptr;
+                    destructor = nullptr;
+                }
+
+                ~Any() {
+                    destroy();
+                }
+            } bucket{};
 
             template<typename T>
             Container& init() {
-                bucket = ComponentBucket<T>{};
+                bucket.template emplace<ComponentBucket<T>>();
                 return *this;
             }
 
             template<typename T>
             ComponentBucket<T>& get() {
-                return std::any_cast<ComponentBucket<T>&>(bucket);
+                return bucket.template get<ComponentBucket<T>>();
             }
             template<typename T>
             const ComponentBucket<T>& get() const {
-                return std::any_cast<const ComponentBucket<T>&>(bucket);
+                return bucket.template get<ComponentBucket<T>>();
             }
 
+            virtual bool empty() const = 0;
             virtual void destroy(Ecs* ecs, const Entity e) = 0;
             virtual void try_destroy(Ecs* ecs, const Entity e) = 0;
             virtual void try_destroy(Ecs* ecs, const std::vector<Entity>& entities) = 0;
@@ -339,16 +494,36 @@ namespace mgm {
         };
         template<typename T>
         Container& get_container() {
+            std::unique_lock lock{mutex};
             return *containers.at(type_of<T>);
         }
         template<typename T>
         const Container& get_container() const {
+            std::unique_lock lock{mutex};
             return *containers.at(type_of<T>);
+        }
+
+        template<typename T>
+        Container* try_get_container() {
+            std::unique_lock lock{mutex};
+            const auto it = containers.find(type_of<T>);
+            if (it == containers.end())
+                return nullptr;
+            return it->second;
+        }
+        template<typename T>
+        const Container* try_get_container() const {
+            std::unique_lock lock{mutex};
+            const auto it = containers.find(type_of<T>);
+            if (it == containers.end())
+                return nullptr;
+            return it->second;
         }
 
         static inline struct EmptyFunctionalContainer : Container {
             using Container::Container;
 
+            virtual bool empty() const override { return true; }
             virtual void destroy(Ecs* ecs, const Entity e) override {};
             virtual void try_destroy(Ecs* ecs, const Entity e) override {};
             virtual void try_destroy(Ecs* ecs, const std::vector<Entity>& entities) override {};
@@ -358,6 +533,7 @@ namespace mgm {
 
         template<typename T>
         const Container* get_container_or_empty_functional() const {
+            std::unique_lock lock{mutex};
             if (container_exists<T>())
                 return &get_container<T>();
             return &empty_functional_container;
@@ -365,9 +541,14 @@ namespace mgm {
 
         template<typename T>
         Container& create_container() {
+            std::unique_lock lock{mutex};
             struct ContainerT : public Container {
                 using Container::Container;
 
+                virtual bool empty() const override {
+                    auto& bucket = Container::template get<T>();
+                    return bucket.empty();
+                }
                 virtual void destroy(Ecs* ecs, const Entity e) override {
                     auto& bucket = Container::template get<T>();
                     bucket.destroy(ecs, e);
@@ -395,6 +576,7 @@ namespace mgm {
         }
         template<typename T>
         Container& get_or_create_container() {
+            std::unique_lock lock{mutex};
             const auto it = containers.find(type_of<T>);
             if (it == containers.end())
                 return create_container<T>();
@@ -403,11 +585,13 @@ namespace mgm {
 
         template<typename T>
         void destroy_container() {
+            std::unique_lock lock{mutex};
             containers.erase(containers.find(type_of<T>));
         }
 
         template<typename T>
         bool container_exists() const {
+            std::unique_lock lock{mutex};
             return containers.find(type_of<T>) != containers.end();
         }
 
@@ -447,10 +631,11 @@ namespace mgm {
 
                 used.erase(id);
             }
-            void try_destroy(const Entity id) {
+            bool try_destroy(const Entity id) {
                 if (used.find(id) == used.end())
-                    return;
+                    return false;
                 destroy(id);
+                return true;
             }
 
             std::unordered_set<Entity>& all() { return used; }
@@ -464,21 +649,31 @@ namespace mgm {
     public:
         MGMecs() = default;
         MGMecs(const MGMecs&) = delete;
-        MGMecs(MGMecs&& eg) {
-            if (this == &eg)
+        MGMecs(MGMecs&& other) {
+            if (this == &other)
                 return;
-            entities = std::move(eg.entities);
-            containers = std::move(eg.containers);
+
+            std::unique_lock lock{mutex};
+            std::unique_lock other_lock{other.mutex};
+
+            entities = std::move(other.entities);
+            containers = std::move(other.containers);
+            groups = std::move(other.groups);
 
             for (const auto& group : groups)
                 group->ecs_moved(this);
         }
         MGMecs& operator=(const MGMecs&) = delete;
-        MGMecs& operator=(MGMecs&& eg) {
-            if (this == &eg)
+        MGMecs& operator=(MGMecs&& other) {
+            if (this == &other)
                 return *this;
-            entities = std::move(eg.entities);
-            containers = std::move(eg.containers);
+
+            std::unique_lock lock{mutex};
+            std::unique_lock other_lock{other.mutex};
+
+            entities = std::move(other.entities);
+            containers = std::move(other.containers);
+            groups = std::move(other.groups);
 
             for (const auto& group : groups)
                 group->ecs_moved(this);
@@ -487,11 +682,13 @@ namespace mgm {
         }
 
         Entity create() {
+            std::unique_lock lock{mutex};
             return entities.create();
         }
 
         template<typename It>
         void create(const It& begin, const It& end) {
+            std::unique_lock lock{mutex};
             for (auto it = begin; it != end; ++it)
                 *it = entities.create();
         }
@@ -531,35 +728,35 @@ namespace mgm {
 
         template<typename T>
         T* try_get(const Entity e) {
-            if (!container_exists<T>())
+            auto* bucket = try_get_container<T>().template get<T>();
+            if (bucket == nullptr)
                 return nullptr;
-            auto& bucket = get_container<T>().template get<T>();
-            return bucket.try_get(e);
+            return bucket->try_get(e);
         }
         template<typename T>
         const T* try_get(const Entity e) const {
-            if (!container_exists<T>())
+            const auto* bucket = try_get_container<T>().template get<T>();
+            if (bucket == nullptr)
                 return nullptr;
-            const auto& bucket = get_container<T>().template get<T>();
-            return bucket.try_get(e);
+            return bucket->try_get(e);
         }
 
         template<typename T>
         bool contains(const Entity e) const {
-            if (!container_exists<T>())
+            const auto* bucket = try_get_container<T>().template get<T>();
+            if (bucket == nullptr)
                 return false;
-            const auto& bucket = get_container<T>().template get<T>();
-            return bucket.try_get(e) != nullptr;
+            return bucket->try_get(e) != nullptr;
         }
 
         template<typename T, typename It>
         bool contains(const It& begin, const It& end) {
-            if (!container_exists<T>())
+            const auto* bucket = try_get_container<T>().template get<T>();
+            if (bucket == nullptr)
                 return false;
-            const auto& bucket = get_container<T>().template get<T>();
             bool does_contain = true;
             for (auto it = begin; it != end && does_contain; ++it)
-                does_contain = does_contain && (bucket.try_get(*it) != nullptr);
+                does_contain = does_contain && (bucket->try_get(*it) != nullptr);
             return does_contain;
         }
 
@@ -570,10 +767,10 @@ namespace mgm {
         }
         template<typename T>
         void try_remove(const Entity e) {
-            auto& bucket = get_container<T>().template get<T>();
-            if (bucket.try_get(e) == nullptr)
+            auto* bucket = try_get_container<T>().template get<T>();
+            if (bucket == nullptr)
                 return;
-            bucket.destroy(this, e);
+            bucket->try_destroy(this, e);
         }
 
         template<typename T, typename It>
@@ -583,59 +780,104 @@ namespace mgm {
         }
         template<typename T, typename It>
         void try_remove(const It& begin, const It& end) {
-            auto& bucket = get_container<T>().template get<T>();
-            bucket.try_destroy(this, begin, end);
+            auto* bucket = try_get_container<T>().template get<T>();
+            if (bucket == nullptr)
+                return;
+            bucket->try_destroy(this, begin, end);
         }
 
         void destroy(const Entity e) {
+            std::unique_lock lock{mutex};
             entities.destroy(e);
-
+            std::vector<Container*> to_destroy{};
+            to_destroy.reserve(containers.size());
             for (auto& [type, container] : containers)
-                container->try_destroy(this, e);
+                if (container->contains(e))
+                    to_destroy.push_back(container);
+            lock.unlock();
+
+            for (auto& container : to_destroy)
+                container->destroy(this, e);
         }
         void try_destroy(const Entity e) {
-            entities.try_destroy(e);
-
+            std::unique_lock lock{mutex};
+            if (!entities.try_destroy(e))
+                return;
+            std::vector<Container*> to_destroy{};
+            to_destroy.reserve(containers.size());
             for (auto& [type, container] : containers)
+                if (container->contains(e))
+                    to_destroy.push_back(container);
+            lock.unlock();
+
+            for (auto& container : to_destroy)
                 container->try_destroy(this, e);
         }
 
         template<typename It>
         void destroy(const It& begin, const It& end) {
             std::vector<Entity> entities_to_destroy{};
+            std::vector<Container*> to_destroy{};
+
+            std::unique_lock lock{mutex};
             entities_to_destroy.reserve(std::distance(begin, end));
             for (auto it = begin; it != end; ++it) {
                 entities.destroy(*it);
                 entities_to_destroy.push_back(*it);
             }
 
+            to_destroy.reserve(containers.size());
             for (auto& [type, container] : containers)
+                to_destroy.push_back(container);
+
+            lock.unlock();
+
+            for (auto& container : to_destroy)
                 container->try_destroy(this, entities_to_destroy);
         }
         template<typename It>
         void try_destroy(const It& begin, const It& end) {
             std::vector<Entity> entities_to_destroy{};
+            std::vector<Container*> to_destroy{};
+
+            std::unique_lock lock{mutex};
             entities_to_destroy.reserve(std::distance(begin, end));
+            bool any_destroyed = false;
             for (auto it = begin; it != end; ++it) {
-                entities.try_destroy(*it);
-                entities_to_destroy.push_back(*it);
+                if (entities.try_destroy(*it)) {
+                    any_destroyed = true;
+                    entities_to_destroy.push_back(*it);
+                }
             }
 
+            if (!any_destroyed)
+                return;
+
+            to_destroy.reserve(containers.size());
             for (auto& [type, container] : containers)
+                to_destroy.push_back(container);
+
+            lock.unlock();
+
+            for (auto& container : to_destroy)
                 container->try_destroy(this, entities_to_destroy);
         }
 
         template<typename EcsType, typename T = void, typename... Ts>
         struct Group {
         private:
+            mutable std::recursive_mutex mutex{};
+
             struct GroupContainerT : public EcsType::GroupContainer {
                 Group<EcsType, T, Ts...>* group{};
                 GroupContainerT(Group<EcsType, T, Ts...>* group) : group{group} {}
 
                 virtual void ecs_moved(Ecs* new_location) override {
+                    std::unique_lock lock{group->mutex};
                     group->ecs = new_location;
                 }
                 virtual void add_unreachable(size_t e) override {
+                    std::unique_lock lock{group->mutex};
                     for (const auto& iterator : group->iterators)
                         iterator->try_add_unreachable(e);
                 }
@@ -654,9 +896,13 @@ namespace mgm {
 
             Group(EcsType& original_ecs) : ecs{&original_ecs} {
                 group_container = new GroupContainerT{const_cast<Group<EcsType, T, Ts...>*>(this)};
-                const_cast<Ecs*>(ecs)->groups.emplace(group_container);
+                std::unique_lock lock{ecs->mutex};
+                ecs->groups.emplace(group_container);
+                lock.unlock();
 
-                auto& bucket = const_cast<Ecs*>(ecs)->template get_container<T>().template get<T>();
+                auto& bucket = ecs->template get_container<T>().template get<T>();
+
+                std::unique_lock bucket_lock{bucket.mutex};
                 bucket.iterating_groups.emplace(group_container);
             }
 
@@ -668,6 +914,7 @@ namespace mgm {
 
                 void try_add_unreachable(size_t c) {
                     const auto& bucket = group->ecs->template get_container<T>().template get<T>();
+                    std::unique_lock lock{bucket.mutex};
                     if (pos == bucket.components.size()) {
                         --pos;
                         return;
@@ -679,22 +926,26 @@ namespace mgm {
                 }
 
                 Iterator(const Group* group, size_t pos) : group(group), pos(pos) {
-                    if (group != nullptr)
-                        const_cast<Group*>(group)->iterators.emplace(this);
+                    if (group != nullptr) {
+                        group->iterators.emplace(this);
+                    }
                 }
                 Iterator() = delete;
                 Iterator(const Iterator& other) {
                     group = other.group;
                     pos = other.pos;
-                    if (group != nullptr)
-                        const_cast<Group*>(group)->iterators.emplace(this);
+                    if (group != nullptr) {
+                        std::unique_lock lock{group->mutex};
+                        group->iterators.emplace(this);
+                    }
                 }
                 Iterator(Iterator&& other) {
                     group = other.group;
                     pos = other.pos;
                     if (group != nullptr) {
-                        const_cast<Group*>(group)->iterators.erase(&other);
-                        const_cast<Group*>(group)->iterators.emplace(this);
+                        std::unique_lock lock{group->mutex};
+                        group->iterators.erase(&other);
+                        group->iterators.emplace(this);
                     }
                 }
                 Iterator& operator=(const Iterator& other) {
@@ -702,8 +953,10 @@ namespace mgm {
                         return *this;
                     group = other.group;
                     pos = other.pos;
-                    if (group != nullptr)
-                        const_cast<Group*>(group)->iterators.emplace(this);
+                    if (group != nullptr) {
+                        std::unique_lock lock{group->mutex};
+                        group->iterators.emplace(this);
+                    }
                     return *this;
                 }
                 Iterator& operator=(Iterator&& other) {
@@ -712,8 +965,9 @@ namespace mgm {
                     group = other.group;
                     pos = other.pos;
                     if (group != nullptr) {
-                        const_cast<Group*>(group)->iterators.erase(&other);
-                        const_cast<Group*>(group)->iterators.emplace(this);
+                        std::unique_lock lock{group->mutex};
+                        group->iterators.erase(&other);
+                        group->iterators.emplace(this);
                     }
                     return *this;
                 }
@@ -721,9 +975,10 @@ namespace mgm {
                 template<typename EcsTypeT = EcsType, std::enable_if_t<std::is_const_v<EcsTypeT>, bool> = true>
                 std::pair<Entity, const T&> operator*() {
                     if (group == nullptr)
-                        throw std::runtime_error("Dereferencing an invalid or end iterator");
+                        throw std::runtime_error("Dereferencing an invalid iterator, or owning group has been destroyed");
 
                     const auto& bucket = group->ecs->template get_container<T>().template get<T>();
+                    std::unique_lock lock{bucket.mutex};
                     if (!unreachable.empty()) {
                         const auto component = *unreachable.begin();
                         dereferenced_last_unreachable = true;
@@ -734,9 +989,10 @@ namespace mgm {
                 template<typename EcsTypeT = EcsType, std::enable_if_t<!std::is_const_v<EcsTypeT>, bool> = true>
                 std::pair<Entity, T&> operator*() {
                     if (group == nullptr)
-                        throw std::runtime_error("Dereferencing an invalid or end iterator");
+                        throw std::runtime_error("Dereferencing an invalid iterator, or owning group has been destroyed");
 
                     auto& bucket = group->ecs->template get_container<T>().template get<T>();
+                    std::unique_lock lock{bucket.mutex};
                     if (!unreachable.empty()) {
                         const auto component = *unreachable.begin();
                         dereferenced_last_unreachable = true;
@@ -747,9 +1003,11 @@ namespace mgm {
 
                 Iterator& operator++() {
                     if (group == nullptr)
-                        throw std::runtime_error("Incrementing an invalid or end iterator");
+                        throw std::runtime_error("Incrementing an invalid iterator, or owning group has been destroyed");
 
                     const auto& bucket = group->ecs->template get_container<T>().template get<T>();
+
+                    std::unique_lock lock{bucket.mutex};
 
                     if (!unreachable.empty()) {
                         if (!dereferenced_last_unreachable)
@@ -766,7 +1024,7 @@ namespace mgm {
                     do {
                         ++pos;
                     }
-                    while (!(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...));
+                    while (!(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...) && (pos < bucket.components.size()));
 
                     if (pos >= bucket.components.size()) {
                         const_cast<Group*>(group)->iterators.erase(this);
@@ -802,13 +1060,15 @@ namespace mgm {
                 }
 
                 ~Iterator() {
-                    if (group != nullptr)
+                    if (group != nullptr) {
+                        std::unique_lock lock{group->mutex};
                         const_cast<Group*>(group)->iterators.erase(this);
+                    }
                 }
             };
 
             private:
-                std::unordered_set<Iterator*> iterators{};
+                mutable std::unordered_set<Iterator*> iterators{};
 
             public:
 
@@ -819,9 +1079,16 @@ namespace mgm {
                     ++pos;
                 return Iterator{this, pos};
             }
-            Iterator end() const { return Iterator{nullptr, 0}; }
+            Iterator end() const {
+                return Iterator{nullptr, 0};
+            }
 
             ~Group() {
+                for (const auto& iterator : iterators) {
+                    iterator->group = nullptr;
+                    iterator->pos = 0;
+                }
+
                 auto& bucket = const_cast<Ecs*>(ecs)->template get_container<T>().template get<T>();
                 bucket.iterating_groups.erase(group_container);
 
@@ -831,7 +1098,7 @@ namespace mgm {
         };
 
     private:
-        std::unordered_set<GroupContainer*> groups{};
+        mutable std::unordered_set<GroupContainer*> groups{};
 
         template <class T, template <class...> class Template>
         struct is_specialization : std::false_type {};
@@ -879,11 +1146,13 @@ namespace mgm {
 
         ~MGMecs() {
             while (!containers.empty()) {
-                const auto container = containers.begin();
+                const auto it = containers.begin();
+                const auto container = it->second;
 
-                container->second->destroy_all(this);
-                delete container->second;
-                containers.erase(container);
+                while (!container->empty())
+                    container->destroy_all(this);
+                delete container;
+                containers.erase(it);
             }
         }
     };
