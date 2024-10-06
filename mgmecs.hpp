@@ -81,6 +81,7 @@ namespace mgm {
         struct GroupContainer {
             virtual void ecs_moved(Ecs* new_location) = 0;
             virtual void add_unreachable(size_t e) = 0;
+            virtual void new_added() = 0;
             virtual ~GroupContainer() = default;
         };
 
@@ -152,6 +153,9 @@ namespace mgm {
                     if (ecs != nullptr)
                         busy_components.insert(c);
 
+                for (auto group : iterating_groups)
+                    group->new_added();
+
                 lock.unlock();
 
                 if constexpr (HAS_CONSTRUCT) {
@@ -181,6 +185,9 @@ namespace mgm {
                     busy_components.insert(components.size() - 1);
                 }
 
+                for (auto group : iterating_groups)
+                    group->new_added();
+
                 lock.unlock();
 
                 if constexpr (HAS_CONSTRUCT) {
@@ -199,6 +206,8 @@ namespace mgm {
 
                 std::unique_lock lock{mutex};
 
+                const auto original_size = original.size();
+
                 for (auto it = begin; it != end; ++it) {
                     if (map.find(*it) != map.end())
                         continue;
@@ -207,6 +216,10 @@ namespace mgm {
                     constructed.emplace_back(&components.emplace_back(std::forward<Ts>(args)...), components.size() - 1);
                     busy_components.insert(components.size() - 1);
                 }
+
+                if (original.size() > original_size)
+                    for (auto group : iterating_groups)
+                        group->new_added();
 
                 lock.unlock();
                 
@@ -867,6 +880,7 @@ namespace mgm {
         struct Group {
         private:
             mutable std::recursive_mutex mutex{};
+            bool is_reversed = false;
 
             struct GroupContainerT : public EcsType::GroupContainer {
                 Group<EcsType, T, Ts...>* group{};
@@ -876,10 +890,15 @@ namespace mgm {
                     std::unique_lock lock{group->mutex};
                     group->ecs = new_location;
                 }
-                virtual void add_unreachable(size_t e) override {
+                virtual void add_unreachable(size_t c) override {
                     std::unique_lock lock{group->mutex};
                     for (const auto& iterator : group->iterators)
-                        iterator->try_add_unreachable(e);
+                        iterator->try_add_unreachable(c);
+                }
+                virtual void new_added() override {
+                    std::unique_lock lock{group->mutex};
+                    for (const auto& iterator : group->iterators)
+                        iterator->try_new_added();
                 }
                 virtual ~GroupContainerT() override = default;
             };
@@ -889,10 +908,30 @@ namespace mgm {
             EcsType* ecs = nullptr;
 
             Group() = delete;
-            Group(const Group&) = delete;
-            Group(Group&&) = delete;
-            Group& operator=(const Group&) = delete;
-            Group& operator=(Group&&) = delete;
+            Group(const Group& other) {
+                new (this) Group{*other.ecs};
+            }
+            Group(Group&& other) {
+                ecs = other.ecs;
+                group_container = other.group_container;
+                other.group_container = nullptr;
+                other.ecs = nullptr;
+            }
+            Group& operator=(const Group other) {
+                if (this == &other)
+                    return *this;
+                destroy_self();
+                new (this) Group{other.ecs};
+            }
+            Group& operator=(Group&& other) {
+                if (this == &other)
+                    return *this;
+                destroy_self();
+                ecs = other.ecs;
+                group_container = other.group_container;
+                other.group_container = nullptr;
+                other.ecs = nullptr;
+            }
 
             Group(EcsType& original_ecs) : ecs{&original_ecs} {
                 group_container = new GroupContainerT{const_cast<Group<EcsType, T, Ts...>*>(this)};
@@ -910,13 +949,15 @@ namespace mgm {
                 const Group* group = nullptr;
                 size_t pos{};
                 std::unordered_set<size_t> unreachable{};
-                bool dereferenced_last_unreachable = false;
+                bool dereferenced_last_unreachable: 1 = false;
+                bool is_end: 1 = false;
+                bool is_reversed: 1 = false;
 
                 void try_add_unreachable(size_t c) {
                     const auto& bucket = group->ecs->template get_container<T>().template get<T>();
                     std::unique_lock lock{bucket.mutex};
-                    if (pos == bucket.components.size()) {
-                        --pos;
+                    if (pos >= bucket.components.size()) {
+                        pos = bucket.components.size();
                         return;
                     }
                     if (c < pos && (group->ecs->template contains_with_include_exclude<Ts>(bucket.original[c]) && ...)) {
@@ -924,11 +965,20 @@ namespace mgm {
                         dereferenced_last_unreachable = false;
                     }
                 }
-
-                Iterator(const Group* group, size_t pos) : group(group), pos(pos) {
-                    if (group != nullptr) {
-                        group->iterators.emplace(this);
+                void try_new_added() {
+                    if (!is_end)
+                        return;
+                    const auto& bucket = group->ecs->template get_container<T>().template get<T>();
+                    std::unique_lock lock{bucket.mutex};
+                    if (pos < bucket.components.size()) {
+                        pos = bucket.components.size();
+                        return;
                     }
+                }
+
+                Iterator(const Group* group, size_t pos, bool is_end = false, bool reverse = false) : group(group), pos(pos), is_end(is_end), is_reversed(reverse) {
+                    if (group != nullptr)
+                        group->iterators.emplace(this);
                 }
                 Iterator() = delete;
                 Iterator(const Iterator& other) {
@@ -984,6 +1034,8 @@ namespace mgm {
                         dereferenced_last_unreachable = true;
                         return std::pair<Entity, const T&>{bucket.original[component], bucket.components[component]};
                     }
+                    if (pos >= bucket.components.size())
+                        throw std::runtime_error("Dereferencing an invalid iterator, or owning group has been destroyed");
                     return std::pair<Entity, const T&>{bucket.original[pos], bucket.components[pos]};
                 }
                 template<typename EcsTypeT = EcsType, std::enable_if_t<!std::is_const_v<EcsTypeT>, bool> = true>
@@ -998,10 +1050,13 @@ namespace mgm {
                         dereferenced_last_unreachable = true;
                         return std::pair<Entity, T&>{bucket.original[component], bucket.components[component]};
                     }
+                    if (pos >= bucket.components.size())
+                        throw std::runtime_error("Dereferencing an invalid iterator, or owning group has been destroyed");
                     return std::pair<Entity, T&>{bucket.original[pos], bucket.components[pos]};
                 }
 
-                Iterator& operator++() {
+            private:
+                Iterator& inc() {
                     if (group == nullptr)
                         throw std::runtime_error("Incrementing an invalid iterator, or owning group has been destroyed");
 
@@ -1021,23 +1076,73 @@ namespace mgm {
                         return ++*this;
                     }
 
+                    if (pos == static_cast<size_t>(-1)) {
+                        pos = 0;
+                        while (!(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...))
+                            ++pos;
+                        return *this;
+                    }
+
+                    if (pos >= bucket.components.size()) {
+                        is_end = true;
+                        pos = bucket.components.size();
+                        return *this;
+                    }
+
                     do {
                         ++pos;
                     }
                     while (!(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...) && (pos < bucket.components.size()));
 
-                    if (pos >= bucket.components.size()) {
-                        const_cast<Group*>(group)->iterators.erase(this);
-                        group = nullptr;
-                        pos = 0;
+                    return *this;
+                }
+                Iterator& dec() {
+                    if (group == nullptr)
+                        throw std::runtime_error("Decrementing an invalid iterator, or owning group has been destroyed");
+
+                    const auto& bucket = group->ecs->template get_container<T>().template get<T>();
+
+                    std::unique_lock lock{bucket.mutex};
+
+                    if (!unreachable.empty())
+                        unreachable.clear();
+
+                    if (pos == 0 || pos == static_cast<size_t>(-1)) {
+                        pos = static_cast<size_t>(-1);
                         return *this;
                     }
 
+                    do {
+                        --pos;
+                    }
+                    while (!(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...) && (pos > 0));
+
+                    if (pos == 0 && !(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...))
+                        ++(*this);
+
                     return *this;
+                }
+
+            public:
+                Iterator& operator++() {
+                    if (is_reversed)
+                        return dec();
+                    return inc();
                 }
                 Iterator operator++(int) {
                     Iterator res{*this};
                     ++(*this);
+                    return res;
+                }
+
+                Iterator& operator--() {
+                    if (is_reversed)
+                        return inc();
+                    return dec();
+                }
+                Iterator operator--(int) {
+                    Iterator res{*this};
+                    --(*this);
                     return res;
                 }
 
@@ -1049,6 +1154,17 @@ namespace mgm {
                 Iterator operator+(size_t n) const {
                     Iterator res{*this};
                     res += n;
+                    return res;
+                }
+
+                Iterator& operator-=(size_t n) {
+                    for (size_t i = 0; i < n && group != nullptr; ++i)
+                        --(*this);
+                    return *this;
+                }
+                Iterator operator-(size_t n) const {
+                    Iterator res{*this};
+                    res -= n;
                     return res;
                 }
 
@@ -1070,30 +1186,76 @@ namespace mgm {
             private:
                 mutable std::unordered_set<Iterator*> iterators{};
 
+                Iterator true_begin() const {
+                    std::unique_lock lock{mutex};
+                    const auto& bucket = ecs->template get_container<T>().template get<T>();
+                    size_t pos = 0;
+                    std::unique_lock bucket_lock{bucket.mutex};
+                    while (!(ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...) && (pos < bucket.components.size()))
+                        ++pos;
+                    return Iterator{this, pos};
+                }
+                Iterator true_end() const {
+                    std::unique_lock lock{mutex};
+                    const auto& bucket = ecs->template get_container<T>().template get<T>();
+                    std::unique_lock bucket_lock{bucket.mutex};
+                    return Iterator{this, bucket.components.size(), true};
+                }
+
             public:
 
             Iterator begin() const {
-                const auto& bucket = ecs->template get_container<T>().template get<T>();
-                size_t pos = 0;
-                while (!(ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...) && (pos < bucket.components.size()))
-                    ++pos;
-                return Iterator{this, pos};
+                Iterator it = is_reversed ? true_end() - 1 : true_begin();
+                it.is_reversed = is_reversed;
+                return it;
             }
             Iterator end() const {
-                return Iterator{nullptr, 0};
+                Iterator it = is_reversed ? true_begin() - 1 : true_end();
+                it.is_reversed = is_reversed;
+                return it;
             }
 
-            ~Group() {
+            Iterator rbegin() const {
+                Iterator it = is_reversed ? true_begin() : true_end() - 1;
+                it.is_reversed = !is_reversed;
+                return it;
+            }
+            Iterator rend() const {
+                Iterator it = is_reversed ? true_end() : true_begin() - 1;
+                it.is_reversed = !is_reversed;
+                return it;
+            }
+
+            Group<EcsType, T, Ts...> reverse() const {
+                std::unique_lock lock{mutex};
+                Group copy{*this};
+                copy.is_reversed = !is_reversed;
+                return copy;
+            }
+
+            void destroy_self() {
+                std::unique_lock lock{mutex};
                 for (const auto& iterator : iterators) {
                     iterator->group = nullptr;
                     iterator->pos = 0;
                 }
+                iterators.clear();
+
+                if (ecs == nullptr)
+                    return;
 
                 auto& bucket = const_cast<Ecs*>(ecs)->template get_container<T>().template get<T>();
                 bucket.iterating_groups.erase(group_container);
 
                 const_cast<Ecs*>(ecs)->groups.erase(ecs->groups.find(group_container));
                 delete group_container;
+
+                ecs = nullptr;
+                group_container = nullptr;
+            }
+
+            ~Group() {
+                destroy_self();
             }
         };
 
