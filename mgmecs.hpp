@@ -1029,7 +1029,7 @@ namespace mgm {
 
                     const auto& bucket = group->ecs->template get_container<T>().template get<T>();
                     std::unique_lock lock{bucket.mutex};
-                    if (!unreachable.empty()) {
+                    if (!unreachable.empty() && !is_reversed) {
                         const auto component = *unreachable.begin();
                         dereferenced_last_unreachable = true;
                         return std::pair<Entity, const T&>{bucket.original[component], bucket.components[component]};
@@ -1045,7 +1045,7 @@ namespace mgm {
 
                     auto& bucket = group->ecs->template get_container<T>().template get<T>();
                     std::unique_lock lock{bucket.mutex};
-                    if (!unreachable.empty()) {
+                    if (!unreachable.empty() && !is_reversed) {
                         const auto component = *unreachable.begin();
                         dereferenced_last_unreachable = true;
                         return std::pair<Entity, T&>{bucket.original[component], bucket.components[component]};
@@ -1099,26 +1099,32 @@ namespace mgm {
                 Iterator& dec() {
                     if (group == nullptr)
                         throw std::runtime_error("Decrementing an invalid iterator, or owning group has been destroyed");
+                    
+                    if (is_end)
+                        is_end = false;
 
                     const auto& bucket = group->ecs->template get_container<T>().template get<T>();
 
                     std::unique_lock lock{bucket.mutex};
 
-                    if (!unreachable.empty())
-                        unreachable.clear();
-
-                    if (pos == 0 || pos == static_cast<size_t>(-1)) {
-                        pos = static_cast<size_t>(-1);
-                        return *this;
-                    }
-
                     do {
-                        --pos;
-                    }
-                    while (!(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...) && (pos > 0));
+                        if (pos == 0 || pos == static_cast<size_t>(-1)) {
+                            pos = static_cast<size_t>(-1);
+                            is_end = true;
+                            return *this;
+                        }
 
-                    if (pos == 0 && !(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...))
-                        ++(*this);
+                        do {
+                            --pos;
+                        }
+                        while (!(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...) && (pos > 0));
+
+                        if (pos == 0 && !(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...)) {
+                            pos = static_cast<size_t>(-1);
+                            return *this;
+                        }
+                    }
+                    while (!unreachable.empty() && unreachable.find(pos) != unreachable.end());
 
                     return *this;
                 }
@@ -1169,7 +1175,7 @@ namespace mgm {
                 }
 
                 bool operator==(const Iterator& other) const {
-                    return pos == other.pos && group == other.group;
+                    return (pos == other.pos && group == other.group) || (is_end && other.is_end);
                 }
                 bool operator!=(const Iterator& other) const {
                     return !(*this == other);
