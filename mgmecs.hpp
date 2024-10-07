@@ -85,6 +85,132 @@ namespace mgm {
             virtual ~GroupContainer() = default;
         };
 
+        template<typename T, typename Hash = std::hash<T>>
+        struct ThreadSafeSet {
+            std::unordered_set<T, Hash> set{};
+            std::mutex mutex{};
+            std::condition_variable cv{};
+            bool allow_locking = true;
+
+            void lock(const T& e) {
+                {
+                    std::unique_lock lock{mutex};
+                    if (!allow_locking)
+                        cv.wait(lock, [this] { return allow_locking; });
+                    set.insert(e);
+                }
+                cv.notify_all();
+            }
+            template<typename It>
+            void lock(const It& begin, const It& end) {
+                {
+                    std::unique_lock lock{mutex};
+                    if (!allow_locking)
+                        cv.wait(lock, [this] { return allow_locking; });
+                    for (auto it = begin; it != end; ++it)
+                        set.insert(*it);
+                }
+                cv.notify_all();
+            }
+
+            void unlock(const T& e) {
+                {
+                    std::unique_lock lock{mutex};
+                    set.erase(e);
+                }
+                cv.notify_all();
+            }
+            template<typename It>
+            void unlock(const It& begin, const It& end) {
+                {
+                    std::unique_lock lock{mutex};
+                    for (auto it = begin; it != end; ++it)
+                        set.erase(*it);
+                }
+                cv.notify_all();
+            }
+
+            bool is_locked(const T& e) {
+                std::unique_lock lock{mutex};
+                return set.find(e) != set.end();
+            }
+
+            void wait(const T& e) {
+                std::unique_lock lock{mutex};
+                cv.wait(lock, [this, e] { return set.find(e) != set.end(); });
+            }
+            template<typename It>
+            void wait(const It& begin, const It& end) {
+                std::unique_lock lock{mutex};
+                cv.wait(lock, [this, begin, end] {
+                    for (auto it = begin; it != end; ++it)
+                        if (set.find(*it) == set.end())
+                            return false;
+                    return true;
+                });
+            }
+
+            void wait_and_lock(const T& e) {
+                {
+                    std::unique_lock lock{mutex};
+                    if (set.find(e) != set.end() || !allow_locking)
+                        cv.wait(lock, [this, e] { return set.find(e) != set.end() && allow_locking; });
+                    set.insert(e);
+                }
+                cv.notify_all();
+            }
+            template<typename It>
+            void wait_and_lock(const It& begin, const It& end) {
+                {
+                    std::unique_lock lock{mutex};
+                    bool any_locked = !allow_locking;
+                    for (auto it = begin; it != end && !any_locked; ++it)
+                        if (set.find(*it) != set.end())
+                            any_locked = true;
+
+                    if (any_locked)
+                        cv.wait(lock, [this, begin, end] {
+                            for (auto it = begin; it != end; ++it)
+                                if (set.find(*it) == set.end())
+                                    return false;
+                            return allow_locking;
+                        });
+
+                    for (auto it = begin; it != end; ++it)
+                        set.insert(*it);
+                }
+                cv.notify_all();
+            }
+
+            void unlock_all() {
+                {
+                    std::unique_lock lock{mutex};
+                    set.clear();
+                }
+                cv.notify_all();
+            }
+
+            void wait_all_and_lock_set() {
+                {
+                    std::unique_lock lock{mutex};
+                    if (!set.empty() || !allow_locking)
+                        cv.wait(lock, [this] { return set.empty() && allow_locking; });
+                    set.clear();
+                    allow_locking = false;
+                }
+                cv.notify_all();
+            }
+            void unlock_set() {
+                {
+                    std::unique_lock lock{mutex};
+                    allow_locking = true;
+                }
+                cv.notify_all();
+            }
+
+            ~ThreadSafeSet() = default;
+        };
+
         template<typename T>
         struct ComponentBucket {
             mutable std::recursive_mutex mutex{};
@@ -93,42 +219,7 @@ namespace mgm {
             std::vector<Entity> original{};
             std::unordered_map<Entity, size_t, typename Entity::Hash> map{};
 
-            struct ThreadSafeSet {
-                std::unordered_set<size_t> set{};
-                std::mutex mutex{};
-                std::condition_variable cv{};
-
-                void insert(size_t e) {
-                    std::unique_lock lock{mutex};
-                    set.insert(e);
-                    cv.notify_all();
-                }
-                void erase(size_t e) {
-                    std::unique_lock lock{mutex};
-                    set.erase(e);
-                    cv.notify_all();
-                }
-                bool contains(size_t e) {
-                    std::unique_lock lock{mutex};
-                    return set.find(e) != set.end();
-                }
-                void wait_without_lock_on(size_t e) {
-                    std::unique_lock lock{mutex};
-                    cv.wait(lock, [this, e] { return set.find(e) != set.end(); });
-                }
-                void lock_on(size_t e) {
-                    std::unique_lock lock{mutex};
-                    if (set.find(e) != set.end())
-                        cv.wait(lock, [this, e] { return set.find(e) != set.end(); });
-                    set.insert(e);
-                }
-                void clear() {
-                    std::unique_lock lock{mutex};
-                    set.clear();
-                    cv.notify_all();
-                }
-                ~ThreadSafeSet() = default;
-            } busy_components{};
+            ThreadSafeSet<size_t> busy_components{};
             
             std::unordered_set<GroupContainer*> iterating_groups{};
 
@@ -151,7 +242,7 @@ namespace mgm {
                 const auto c = components.size() - 1;
                 if constexpr (HAS_CONSTRUCT)
                     if (ecs != nullptr)
-                        busy_components.insert(c);
+                        busy_components.lock(c);
 
                 for (auto group : iterating_groups)
                     group->new_added();
@@ -161,7 +252,7 @@ namespace mgm {
                 if constexpr (HAS_CONSTRUCT) {
                     if (ecs != nullptr) {
                         component.on_construct(ecs, e);
-                        busy_components.erase(c);
+                        busy_components.unlock(c);
                     }
                 }
 
@@ -182,7 +273,7 @@ namespace mgm {
                     map.emplace(*it, components.size());
                     original.emplace_back(*it);
                     constructed.emplace_back(&components.emplace_back(std::forward<Ts>(args)...), components.size() - 1);
-                    busy_components.insert(components.size() - 1);
+                    busy_components.lock(components.size() - 1);
                 }
 
                 for (auto group : iterating_groups)
@@ -194,7 +285,7 @@ namespace mgm {
                     if (ecs != nullptr) {
                         for (const auto& [component, c] : constructed) {
                             component->on_construct(ecs, original[c]);
-                            busy_components.erase(c);
+                            busy_components.unlock(c);
                         }
                     }
                 }
@@ -214,7 +305,7 @@ namespace mgm {
                     map.emplace(*it, components.size());
                     original.emplace_back(*it);
                     constructed.emplace_back(&components.emplace_back(std::forward<Ts>(args)...), components.size() - 1);
-                    busy_components.insert(components.size() - 1);
+                    busy_components.lock(components.size() - 1);
                 }
 
                 if (original.size() > original_size)
@@ -227,7 +318,7 @@ namespace mgm {
                     if (ecs != nullptr) {
                         for (const auto& [component, c] : constructed) {
                             component->on_construct(ecs, original[c]);
-                            busy_components.erase(c);
+                            busy_components.unlock(c);
                         }
                     }
                 }
@@ -304,7 +395,7 @@ namespace mgm {
                     if (it == map.end())
                         throw std::runtime_error("Entity doesn't contain a component of this type");
 
-                busy_components.lock_on(it->second);
+                busy_components.wait_and_lock(it->second);
                 lock.unlock();
 
                 const auto c = it->second;
@@ -312,7 +403,7 @@ namespace mgm {
                 if constexpr (HAS_DESTROY) {
                     if (ecs != nullptr) {
                         components[c].on_destroy(ecs, e);
-                        busy_components.erase(c);
+                        busy_components.unlock(c);
                     }
                 }
 
@@ -326,7 +417,7 @@ namespace mgm {
                 if (it == map.end())
                     return false;
 
-                busy_components.lock_on(it->second);
+                busy_components.wait_and_lock(it->second);
                 lock.unlock();
 
                 const auto c = it->second;
@@ -334,7 +425,7 @@ namespace mgm {
                 if constexpr (HAS_DESTROY) {
                     if (ecs != nullptr) {
                         components[c].on_destroy(ecs, e);
-                        busy_components.erase(c);
+                        busy_components.unlock(c);
                     }
                 }
 
@@ -386,7 +477,7 @@ namespace mgm {
                     if constexpr (safety)
                         if (entity_it == map.end())
                             throw std::runtime_error("Entity doesn't contain a component of this type");
-                    busy_components.lock_on(entity_it->second);
+                    busy_components.wait_and_lock(entity_it->second);
                     to_remove.push_back(entity_it);
                 }
 
@@ -396,7 +487,7 @@ namespace mgm {
                     if (ecs != nullptr) {
                         for (const auto& it : to_remove) {
                             components[it->second].on_destroy(ecs, it->first);
-                            busy_components.erase(it->second);
+                            busy_components.unlock(it->second);
                         }
                     }
                 }
@@ -420,7 +511,7 @@ namespace mgm {
                 for (auto it = begin; it != end; ++it) {
                     const auto entity_it = map.find(*it);
                     if (entity_it != map.end()) {
-                        busy_components.lock_on(entity_it->second);
+                        busy_components.wait_and_lock(entity_it->second);
                         to_remove.push_back(entity_it);
                     }
                 }
@@ -431,7 +522,7 @@ namespace mgm {
                     if (ecs != nullptr) {
                         for (const auto& it : to_remove) {
                             components[it->second].on_destroy(ecs, it->first);
-                            busy_components.erase(it->second);
+                            busy_components.unlock(it->second);
                         }
                     }
                 }
@@ -531,25 +622,6 @@ namespace mgm {
             if (it == containers.end())
                 return nullptr;
             return it->second;
-        }
-
-        static inline struct EmptyFunctionalContainer : Container {
-            using Container::Container;
-
-            virtual bool empty() const override { return true; }
-            virtual void destroy(Ecs* ecs, const Entity e) override {};
-            virtual void try_destroy(Ecs* ecs, const Entity e) override {};
-            virtual void try_destroy(Ecs* ecs, const std::vector<Entity>& entities) override {};
-            virtual bool contains(const Entity e) const override { return false; }
-            virtual void destroy_all(Ecs* ecs) override {};
-        } empty_functional_container{};
-
-        template<typename T>
-        const Container* get_container_or_empty_functional() const {
-            std::unique_lock lock{mutex};
-            if (container_exists<T>())
-                return &get_container<T>();
-            return &empty_functional_container;
         }
 
         template<typename T>
@@ -658,6 +730,7 @@ namespace mgm {
         };
         EntityManager entities{};
         std::unordered_map<TypeID, Container*> containers{};
+        ThreadSafeSet<Entity, typename Entity::Hash> locks{};
 
     public:
         MGMecs() = default;
@@ -669,12 +742,17 @@ namespace mgm {
             std::unique_lock lock{mutex};
             std::unique_lock other_lock{other.mutex};
 
+            other.locks.wait_all_and_lock_set();
+
             entities = std::move(other.entities);
             containers = std::move(other.containers);
+            locks = std::move(other.locks);
             groups = std::move(other.groups);
 
             for (const auto& group : groups)
                 group->ecs_moved(this);
+
+            locks.unlock_set();
         }
         MGMecs& operator=(const MGMecs&) = delete;
         MGMecs& operator=(MGMecs&& other) {
@@ -684,12 +762,17 @@ namespace mgm {
             std::unique_lock lock{mutex};
             std::unique_lock other_lock{other.mutex};
 
+            other.locks.wait_all_and_lock_set();
+
             entities = std::move(other.entities);
             containers = std::move(other.containers);
+            locks = std::move(other.locks);
             groups = std::move(other.groups);
 
             for (const auto& group : groups)
                 group->ecs_moved(this);
+
+            locks.unlock_set();
 
             return *this;
         }
@@ -776,30 +859,40 @@ namespace mgm {
         template<typename T>
         void remove(const Entity e) {
             auto& bucket = get_container<T>().template get<T>();
+            locks.wait_and_lock(e);
             bucket.destroy(this, e);
+            locks.unlock(e);
         }
         template<typename T>
         void try_remove(const Entity e) {
             auto* bucket = try_get_container<T>().template get<T>();
             if (bucket == nullptr)
                 return;
+            locks.wait_and_lock(e);
             bucket->try_destroy(this, e);
+            locks.unlock(e);
         }
 
         template<typename T, typename It>
         void remove(const It& begin, const It& end) {
             auto& bucket = get_container<T>().template get<T>();
+            locks.wait_and_lock(begin, end);
             bucket.destroy(this, begin, end);
+            locks.unlock(begin, end);
         }
         template<typename T, typename It>
         void try_remove(const It& begin, const It& end) {
             auto* bucket = try_get_container<T>().template get<T>();
             if (bucket == nullptr)
                 return;
+            locks.wait_and_lock(begin, end);
             bucket->try_destroy(this, begin, end);
+            locks.unlock(begin, end);
         }
 
         void destroy(const Entity e) {
+            locks.wait_and_lock(e);
+
             std::unique_lock lock{mutex};
             entities.destroy(e);
             std::vector<Container*> to_destroy{};
@@ -811,11 +904,16 @@ namespace mgm {
 
             for (auto& container : to_destroy)
                 container->destroy(this, e);
+
+            locks.unlock(e);
         }
         void try_destroy(const Entity e) {
             std::unique_lock lock{mutex};
+            locks.wait_and_lock(e);
+
             if (!entities.try_destroy(e))
                 return;
+
             std::vector<Container*> to_destroy{};
             to_destroy.reserve(containers.size());
             for (auto& [type, container] : containers)
@@ -825,6 +923,8 @@ namespace mgm {
 
             for (auto& container : to_destroy)
                 container->try_destroy(this, e);
+
+            locks.unlock(e);
         }
 
         template<typename It>
@@ -834,6 +934,9 @@ namespace mgm {
 
             std::unique_lock lock{mutex};
             entities_to_destroy.reserve(std::distance(begin, end));
+
+            locks.wait_and_lock(begin, end);
+
             for (auto it = begin; it != end; ++it) {
                 entities.destroy(*it);
                 entities_to_destroy.push_back(*it);
@@ -847,6 +950,8 @@ namespace mgm {
 
             for (auto& container : to_destroy)
                 container->try_destroy(this, entities_to_destroy);
+
+            locks.unlock(begin, end);
         }
         template<typename It>
         void try_destroy(const It& begin, const It& end) {
@@ -856,6 +961,9 @@ namespace mgm {
             std::unique_lock lock{mutex};
             entities_to_destroy.reserve(std::distance(begin, end));
             bool any_destroyed = false;
+
+            locks.wait_and_lock(begin, end);
+
             for (auto it = begin; it != end; ++it) {
                 if (entities.try_destroy(*it)) {
                     any_destroyed = true;
@@ -863,8 +971,10 @@ namespace mgm {
                 }
             }
 
-            if (!any_destroyed)
+            if (!any_destroyed) {
+                locks.unlock(begin, end);
                 return;
+            }
 
             to_destroy.reserve(containers.size());
             for (auto& [type, container] : containers)
@@ -874,6 +984,8 @@ namespace mgm {
 
             for (auto& container : to_destroy)
                 container->try_destroy(this, entities_to_destroy);
+
+            locks.unlock(begin, end);
         }
 
         template<typename EcsType, typename T = void, typename... Ts>
@@ -949,9 +1061,10 @@ namespace mgm {
                 const Group* group = nullptr;
                 size_t pos{};
                 std::unordered_set<size_t> unreachable{};
-                bool dereferenced_last_unreachable: 1 = false;
+                bool unreachable_added_since_last_inc: 1 = false;
                 bool is_end: 1 = false;
                 bool is_reversed: 1 = false;
+                Entity locked = null;
 
                 void try_add_unreachable(size_t c) {
                     const auto& bucket = group->ecs->template get_container<T>().template get<T>();
@@ -962,7 +1075,7 @@ namespace mgm {
                     }
                     if (c < pos && (group->ecs->template contains_with_include_exclude<Ts>(bucket.original[c]) && ...)) {
                         unreachable.insert(c);
-                        dereferenced_last_unreachable = false;
+                        unreachable_added_since_last_inc = true;
                     }
                 }
                 void try_new_added() {
@@ -1031,7 +1144,6 @@ namespace mgm {
                     std::unique_lock lock{bucket.mutex};
                     if (!unreachable.empty() && !is_reversed) {
                         const auto component = *unreachable.begin();
-                        dereferenced_last_unreachable = true;
                         return std::pair<Entity, const T&>{bucket.original[component], bucket.components[component]};
                     }
                     if (pos >= bucket.components.size())
@@ -1047,7 +1159,6 @@ namespace mgm {
                     std::unique_lock lock{bucket.mutex};
                     if (!unreachable.empty() && !is_reversed) {
                         const auto component = *unreachable.begin();
-                        dereferenced_last_unreachable = true;
                         return std::pair<Entity, T&>{bucket.original[component], bucket.components[component]};
                     }
                     if (pos >= bucket.components.size())
@@ -1064,22 +1175,33 @@ namespace mgm {
 
                     std::unique_lock lock{bucket.mutex};
 
-                    if (!unreachable.empty()) {
-                        if (!dereferenced_last_unreachable)
-                            return *this;
+                    if (locked != null) {
+                        group->ecs->locks.unlock(locked);
+                        locked = null;
+                    }
 
-                        do {
-                            unreachable.erase(unreachable.begin());
+                    if (!unreachable.empty()) {
+                        if (unreachable_added_since_last_inc) {
+                            unreachable_added_since_last_inc = false;
+                            group->ecs->locks.wait_and_lock(locked = bucket.original[*unreachable.begin()]);
+                            return *this;
                         }
-                        while (!unreachable.empty() && !(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...));
-                        dereferenced_last_unreachable = false;
-                        return ++*this;
+
+                        unreachable.erase(unreachable.begin());
+                        if (unreachable.empty()) {
+                            ++*this;
+                            group->ecs->locks.wait_and_lock(locked = bucket.original[pos]);
+                            return *this;
+                        }
+                        group->ecs->locks.wait_and_lock(locked = bucket.original[*unreachable.begin()]);
+                        return *this;
                     }
 
                     if (pos == static_cast<size_t>(-1)) {
                         pos = 0;
                         while (!(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...))
                             ++pos;
+                        group->ecs->locks.wait_and_lock(locked = bucket.original[pos]);
                         return *this;
                     }
 
@@ -1094,6 +1216,9 @@ namespace mgm {
                     }
                     while (!(group->ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...) && (pos < bucket.components.size()));
 
+                    if (pos < bucket.components.size())
+                        group->ecs->locks.wait_and_lock(locked = bucket.original[pos]);
+
                     return *this;
                 }
                 Iterator& dec() {
@@ -1106,6 +1231,11 @@ namespace mgm {
                     const auto& bucket = group->ecs->template get_container<T>().template get<T>();
 
                     std::unique_lock lock{bucket.mutex};
+
+                    if (locked != null) {
+                        group->ecs->locks.unlock(locked);
+                        locked = null;
+                    }
 
                     do {
                         if (pos == 0 || pos == static_cast<size_t>(-1)) {
@@ -1125,6 +1255,9 @@ namespace mgm {
                         }
                     }
                     while (!unreachable.empty() && unreachable.find(pos) != unreachable.end());
+
+                    if (pos < bucket.components.size())
+                        group->ecs->locks.wait_and_lock(locked = bucket.original[pos]);
 
                     return *this;
                 }
@@ -1182,6 +1315,9 @@ namespace mgm {
                 }
 
                 ~Iterator() {
+                    if (locked != null)
+                        group->ecs->locks.unlock(locked);
+
                     if (group != nullptr) {
                         std::unique_lock lock{group->mutex};
                         const_cast<Group*>(group)->iterators.erase(this);
@@ -1288,7 +1424,10 @@ namespace mgm {
         template<typename IE>
         bool contains_with_include_exclude(const Entity e) const {
             using T = get_specialization_type_t<IE>;
-            const auto contains = get_container_or_empty_functional<T>()->contains(e);
+            const auto container = try_get_container<T>();
+            if (container == nullptr)
+                return is_specialization<IE, Exclude>{};
+            const bool contains = container->contains(e);
             return (contains && is_specialization<IE, Exclude>{}) || (!contains && is_specialization<IE, Include>{});
         }
 
