@@ -644,9 +644,9 @@ namespace mgm {
                         return;
                     bucket.destroy(ecs, e);
                 }
-                virtual void try_destroy(Ecs* ecs, const std::vector<Entity>& entities) override {
+                virtual void try_destroy(Ecs* ecs, const std::vector<Entity>& es) override {
                     auto& bucket = Container::template get<T>();
-                    bucket.try_destroy(ecs, entities.begin(), entities.end());
+                    bucket.try_destroy(ecs, es.begin(), es.end());
                 }
                 virtual bool contains(const Entity e) const override {
                     auto& bucket = Container::template get<T>();
