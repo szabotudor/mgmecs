@@ -39,10 +39,12 @@ namespace mgm {
 
     public:
         class Entity {
+        public:
             EntityType value_;
 
-        public:
-            constexpr Entity() : value_(0) {}
+            using Type = EntityType;
+
+            constexpr Entity() : value_(null.value_) {}
 
             constexpr Entity(EntityType value) : value_(value) {}
             constexpr explicit operator EntityType() const { return value_; }
@@ -66,10 +68,10 @@ namespace mgm {
             constexpr friend std::istream& operator>>(std::istream& is, Entity& e) { return is >> e.value_; }
 
             struct Hash {
-                std::size_t operator()(const Entity& e) const { return std::hash<uint32_t>()(e.value_); }
+                std::size_t operator()(const Entity& e) const { return std::hash<EntityType>()(e.value_); }
             };
         };
-        static constexpr Entity null = static_cast<Entity>(-1);
+        static constexpr Entity null = static_cast<Entity>(static_cast<EntityType>(-1));
         static constexpr Entity zero = static_cast<Entity>(0);
 
         using TypeID = decltype(TypeHash<void>::value);
@@ -723,8 +725,8 @@ namespace mgm {
                 return true;
             }
 
-            std::unordered_set<Entity>& all() { return used; }
-            const std::unordered_set<Entity>& all() const { return used; }
+            std::unordered_set<Entity, typename Entity::Hash>& all() { return used; }
+            const std::unordered_set<Entity, typename Entity::Hash>& all() const { return used; }
 
             ~EntityManager() = default;
         };
@@ -987,6 +989,30 @@ namespace mgm {
 
             locks.unlock(begin, end);
         }
+        
+        template<typename T>
+        Entity as_entity(const T& component) const {
+            const auto* container = try_get_container<T>();
+            if (container == nullptr)
+                return null;
+
+            const auto& bucket = container->template get<T>();
+
+            std::unique_lock lock{bucket.mutex};
+
+            const auto* first = bucket.components.data();
+            const auto* last = first + bucket.components.size();
+
+            if (&component < first || &component >= last)
+                return null;
+
+            return bucket.original[&component - first];
+        }
+
+        EntityType entities_count() const {
+            std::unique_lock lock{mutex};
+            return static_cast<EntityType>(entities.all().size());
+        }
 
         template<typename EcsType, typename T = void, typename... Ts>
         struct Group {
@@ -996,7 +1022,7 @@ namespace mgm {
 
             struct GroupContainerT : public EcsType::GroupContainer {
                 Group<EcsType, T, Ts...>* group{};
-                GroupContainerT(Group<EcsType, T, Ts...>* group) : group{group} {}
+                GroupContainerT(Group<EcsType, T, Ts...>* group_to_hold) : group{group_to_hold} {}
 
                 virtual void ecs_moved(Ecs* new_location) override {
                     std::unique_lock lock{group->mutex};
@@ -1089,9 +1115,9 @@ namespace mgm {
                     }
                 }
 
-                Iterator(const Group* group, size_t pos, bool is_end = false, bool reverse = false) : group(group), pos(pos), is_end(is_end), is_reversed(reverse) {
-                    if (group != nullptr)
-                        group->iterators.emplace(this);
+                Iterator(const Group* group_to_iterate, size_t start_pos, bool is_end_iterator = false, bool reverse = false) : group(group_to_iterate), pos(start_pos), is_end(is_end_iterator), is_reversed(reverse) {
+                    if (group_to_iterate != nullptr)
+                        group_to_iterate->iterators.emplace(this);
                 }
                 Iterator() = delete;
                 Iterator(const Iterator& other) {
