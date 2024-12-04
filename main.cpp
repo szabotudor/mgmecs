@@ -1,6 +1,7 @@
 #include "mgmecs.hpp"
 #include <ios>
 #include <iostream>
+#include <chrono>
 
 
 struct String {
@@ -18,35 +19,55 @@ struct String {
 };
 
 
+auto test_mgmecs() {
+    using namespace mgm;
+
+    std::chrono::high_resolution_clock::duration avg_time{};
+
+    for (size_t i = 0; i < 10000; i++) {
+        const auto start = std::chrono::high_resolution_clock::now();
+
+        MGMecs<> ecs{};
+
+        std::vector<MGMecs<>::Entity> entities{};
+        entities.resize(40);
+        ecs.create(entities.begin(), entities.end());
+
+        ecs.emplace<int>(entities.begin(), entities.end() - 8, 0);
+        ecs.emplace<float>(entities.end() - 12, entities.end(), 16.5f);
+        ecs.emplace<double>(entities.end() - 15, entities.end() - 5, 3.1415);
+
+        auto& et = ecs.get_or_emplace<String>(entities[14], "Hello World!");
+
+        for (const auto& e : ecs.group<double>()) {
+            if (e.first == 28) {
+                MGMecs<>::Entity* ptr = new MGMecs<>::Entity[5];
+                ptr[0] = 25; ptr[1] = 26; ptr[2] = 27; ptr[3] = 31; ptr[4] = 30;
+                ecs.destroy(ptr, ptr + 2);
+            }
+            std::cout << e.first << ' ' << ecs.get<double>(e.first) << std::endl;
+        }
+        std::cout << std::endl;
+        
+        const auto end = std::chrono::high_resolution_clock::now();
+
+        avg_time += end - start;
+    }
+    avg_time /= 10000;
+    
+    return avg_time;
+}
+
+
 int main() {
     using namespace mgm;
     std::cout << std::boolalpha;
 
-    MGMecs<> ecs{};
+    std::cout << "Starting tests...\n";
 
-    std::vector<MGMecs<>::Entity> entities{};
-    entities.resize(40);
-    ecs.create(entities.begin(), entities.end());
+    const auto _mgmecs = test_mgmecs().count();
 
-    ecs.emplace<int>(entities.begin(), entities.end() - 8, 0);
-    ecs.emplace<float>(entities.end() - 12, entities.end(), 16.5f);
-    ecs.emplace<double>(entities.end() - 15, entities.end() - 5, 3.1415);
-
-    auto& et = ecs.get_or_emplace<String>(entities[14], "Hello World!");
-
-    const auto& const_ecs = const_cast<const MGMecs<>&>(ecs);
-
-    const auto group = const_ecs.group<double, MGMecs<>::Exclude<int>>();
-
-    for (const auto& e : group) {
-        if (e.first == 28) {
-            MGMecs<>::Entity* ptr = new MGMecs<>::Entity[5];
-            ptr[0] = 25; ptr[1] = 26; ptr[2] = 27; ptr[3] = 31; ptr[4] = 30;
-            ecs.destroy(ptr, ptr + 4);
-        }
-        std::cout << e.first << ' ' << e.second << std::endl;
-    }
-    std::cout << std::endl;
+    std::cout << "MGMecs: " << _mgmecs << "ns\n";
 
     return 0;
 }
