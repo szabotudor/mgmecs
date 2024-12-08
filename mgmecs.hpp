@@ -826,10 +826,12 @@ namespace mgm {
 
         template<typename T>
         T* try_get(const Entity e) {
-            auto* bucket = try_get_container<T>().template get<T>();
-            if (bucket == nullptr)
+            auto* container = try_get_container<T>();
+            if (container == nullptr)
                 return nullptr;
-            return bucket->try_get(e);
+
+            auto& bucket = container->template get<T>();
+            return bucket.try_get(e);
         }
         template<typename T>
         const T* try_get(const Entity e) const {
@@ -841,10 +843,7 @@ namespace mgm {
 
         template<typename T>
         bool contains(const Entity e) const {
-            const auto* bucket = try_get_container<T>().template get<T>();
-            if (bucket == nullptr)
-                return false;
-            return bucket->try_get(e) != nullptr;
+            return try_get<T>(e) != nullptr;
         }
 
         template<typename T, typename It>
@@ -867,11 +866,11 @@ namespace mgm {
         }
         template<typename T>
         void try_remove(const Entity e) {
-            auto* bucket = try_get_container<T>().template get<T>();
-            if (bucket == nullptr)
-                return;
+            auto* container = try_get_container<T>();
+            auto& bucket = container->template get<T>();
+
             locks.wait_and_lock(e);
-            bucket->try_destroy(this, e);
+            bucket.try_destroy(this, e);
             locks.unlock(e);
         }
 
