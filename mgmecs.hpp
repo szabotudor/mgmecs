@@ -225,6 +225,9 @@ namespace mgm {
             
             std::unordered_set<GroupContainer*> iterating_groups{};
 
+            static inline thread_local std::vector<typename decltype(map)::iterator> needs_to_destroy{};
+            static inline thread_local bool is_destroying_something = false;
+
             ComponentBucket() = default;
 
             bool empty() const {
@@ -397,21 +400,51 @@ namespace mgm {
                     if (it == map.end())
                         throw std::runtime_error("Entity doesn't contain a component of this type");
 
-                busy_components.wait_and_lock(it->second);
-                lock.unlock();
-
-                const auto c = it->second;
+                auto c = it->second;
+                busy_components.wait_and_lock(c);
 
                 if constexpr (HAS_DESTROY) {
                     if (ecs != nullptr) {
+                        if (is_destroying_something) {
+                            busy_components.wait_and_lock(c);
+                            components[c].on_destroy(ecs, e);
+                            needs_to_destroy.emplace_back(it);
+                            return;
+                        }
+                        is_destroying_something = true;
                         components[c].on_destroy(ecs, e);
+
+                        for (const auto& nc : needs_to_destroy) {
+                            const auto nc_c = nc->second;
+                            map.erase(nc);
+                            __destroy(nc_c);
+                            busy_components.unlock(nc_c);
+                            if (nc_c < c) {
+                                if (c == components.size() - 1)
+                                    c = nc_c;
+                                else
+                                    --c;
+                            }
+                        }
+                        needs_to_destroy.clear();
+
+                        map.erase(it);
+                        __destroy(c);
                         busy_components.unlock(c);
+
+                        is_destroying_something = false;
                     }
                 }
-
-                lock.lock();
-                map.erase(it);
-                __destroy(c);
+                else {
+                    if (!is_destroying_something) {
+                        map.erase(it);
+                        __destroy(c);
+                    }
+                    else {
+                        busy_components.wait_and_lock(c);
+                        needs_to_destroy.emplace_back(it);
+                    }
+                }
             }
             bool try_destroy(Ecs* ecs, const Entity e) {
                 std::unique_lock lock{mutex};
@@ -419,121 +452,84 @@ namespace mgm {
                 if (it == map.end())
                     return false;
 
-                busy_components.wait_and_lock(it->second);
-                lock.unlock();
-
-                const auto c = it->second;
+                auto c = it->second;
+                busy_components.wait_and_lock(c);
 
                 if constexpr (HAS_DESTROY) {
                     if (ecs != nullptr) {
+                        if (is_destroying_something) {
+                            busy_components.wait_and_lock(c);
+                            components[c].on_destroy(ecs, e);
+                            needs_to_destroy.emplace_back(it);
+                            return true;
+                        }
+                        is_destroying_something = true;
                         components[c].on_destroy(ecs, e);
+
+                        for (const auto& nc : needs_to_destroy) {
+                            const auto nc_c = nc->second;
+                            map.erase(nc);
+                            __destroy(nc_c);
+                            busy_components.unlock(nc_c);
+                            if (nc_c < c) {
+                                if (c == components.size() - 1)
+                                    c = nc_c;
+                                else
+                                    --c;
+                            }
+                        }
+                        needs_to_destroy.clear();
+
+                        map.erase(it);
+                        if (!__destroy(c)) {
+                            busy_components.unlock(c);
+                            is_destroying_something = false;
+                            return false;
+                        }
                         busy_components.unlock(c);
+
+                        is_destroying_something = false;
                     }
+                    return true;
                 }
-
-                lock.lock();
-                map.erase(it);
-                return __destroy(c);
-            }
-
-        private:
-            void __destroy_from_to(std::vector<typename decltype(map)::iterator>& to_remove) {
-                std::sort(to_remove.begin(), to_remove.end(),
-                    [](decltype(map)::iterator a, decltype(map)::iterator b) { return a->second < b->second; }
-                );
-
-                for (auto rit = to_remove.rbegin(); rit != to_remove.rend(); ++rit) {
-                    const size_t c = (*rit)->second;
-
-                    if (c == components.size() - 1) {
-                        components.pop_back();
-                        original.pop_back();
-                        continue;
-                    }
-
-                    std::swap(components[c], components.back());
-                    std::swap(original[c], original.back());
-                    map[original[c]] = c;
-                    components.pop_back();
-                    original.pop_back();
-
-                    if (!iterating_groups.empty())
-                        for (auto group : iterating_groups)
-                            group->add_unreachable(c);
+                else {
+                    map.erase(it);
+                    return __destroy(c);
                 }
             }
 
-        public:
             template<typename It>
             void destroy(Ecs* ecs, const It& begin, const It& end) {
-                if (begin == end)
-                    return;
-
-                std::vector<typename decltype(map)::iterator> to_remove;
-                to_remove.reserve(std::distance(begin, end));
-
                 std::unique_lock lock{mutex};
 
-                for (auto it = begin; it != end; ++it) {
-                    const auto entity_it = map.find(*it);
-                    if constexpr (safety)
-                        if (entity_it == map.end())
-                            throw std::runtime_error("Entity doesn't contain a component of this type");
-                    busy_components.wait_and_lock(entity_it->second);
-                    to_remove.push_back(entity_it);
-                }
+                std::vector<Entity> to_delete{begin, end};
 
-                lock.unlock();
+                std::sort(to_delete.begin(), to_delete.end(), [&](const Entity lhs, const Entity rhs) {
+                    return map.at(lhs) < map.at(rhs);
+                });
 
-                if constexpr (HAS_DESTROY) {
-                    if (ecs != nullptr) {
-                        for (const auto& it : to_remove) {
-                            components[it->second].on_destroy(ecs, it->first);
-                            busy_components.unlock(it->second);
-                        }
-                    }
-                }
-
-                lock.lock();
-                for (const auto& it : to_remove)
-                    map.erase(it);
-
-                __destroy_from_to(to_remove);
+                for (auto it = begin; it != end; ++it)
+                    destroy(ecs, *it);
             }
             template<typename It>
             void try_destroy(Ecs* ecs, const It& begin, const It& end) {
-                if (begin == end)
-                    return;
-
-                std::vector<typename decltype(map)::iterator> to_remove;
-                to_remove.reserve(std::distance(begin, end));
-
                 std::unique_lock lock{mutex};
 
-                for (auto it = begin; it != end; ++it) {
-                    const auto entity_it = map.find(*it);
-                    if (entity_it != map.end()) {
-                        busy_components.wait_and_lock(entity_it->second);
-                        to_remove.push_back(entity_it);
+                std::vector<Entity> to_delete{begin, end};
+
+                for (size_t i = 0; i < to_delete.size(); ++i) {
+                    if (!map.contains(to_delete[i])) {
+                        to_delete.erase(to_delete.begin() + i);
+                        --i;
                     }
                 }
 
-                lock.unlock();
+                std::sort(to_delete.begin(), to_delete.end(), [&](const Entity lhs, const Entity rhs) {
+                    return map.at(lhs) < map.at(rhs);
+                });
 
-                if constexpr (HAS_DESTROY) {
-                    if (ecs != nullptr) {
-                        for (const auto& it : to_remove) {
-                            components[it->second].on_destroy(ecs, it->first);
-                            busy_components.unlock(it->second);
-                        }
-                    }
-                }
-
-                lock.lock();
-                for (const auto& it : to_remove)
-                    map.erase(it);
-
-                __destroy_from_to(to_remove);
+                for (auto it = begin; it != end; ++it)
+                    try_destroy(ecs, *it);
             }
 
             void destroy_all(Ecs* ecs) {
@@ -543,6 +539,8 @@ namespace mgm {
         };
 
         struct Container {
+            Container() = default;
+
             struct Any {
                 void* value = nullptr;
                 std::function<void(void*)> destructor = nullptr;
@@ -737,7 +735,7 @@ namespace mgm {
     public:
         MGMecs() = default;
         MGMecs(const MGMecs&) = delete;
-        MGMecs(MGMecs&& other) {
+        MGMecs(MGMecs&& other) noexcept {
             if (this == &other)
                 return;
 
@@ -757,7 +755,7 @@ namespace mgm {
             locks.unlock_set();
         }
         MGMecs& operator=(const MGMecs&) = delete;
-        MGMecs& operator=(MGMecs&& other) {
+        MGMecs& operator=(MGMecs&& other) noexcept {
             if (this == &other)
                 return *this;
 
@@ -930,11 +928,15 @@ namespace mgm {
 
         template<typename It>
         void destroy(const It& begin, const It& end) {
+            const auto dist = std::distance(begin, end);
+            if (dist == 0)
+                return;
+
             std::vector<Entity> entities_to_destroy{};
             std::vector<Container*> to_destroy{};
 
             std::unique_lock lock{mutex};
-            entities_to_destroy.reserve(std::distance(begin, end));
+            entities_to_destroy.reserve(dist);
 
             locks.wait_and_lock(begin, end);
 
@@ -1048,19 +1050,20 @@ namespace mgm {
             Group(const Group& other) {
                 new (this) Group{*other.ecs};
             }
-            Group(Group&& other) {
+            Group(Group&& other) noexcept {
                 ecs = other.ecs;
                 group_container = other.group_container;
                 other.group_container = nullptr;
                 other.ecs = nullptr;
             }
-            Group& operator=(const Group other) {
+            Group& operator=(const Group& other) {
                 if (this == &other)
                     return *this;
                 destroy_self();
                 new (this) Group{other.ecs};
+                return *this;
             }
-            Group& operator=(Group&& other) {
+            Group& operator=(Group&& other) noexcept {
                 if (this == &other)
                     return *this;
                 destroy_self();
@@ -1068,6 +1071,7 @@ namespace mgm {
                 group_container = other.group_container;
                 other.group_container = nullptr;
                 other.ecs = nullptr;
+                return *this;
             }
 
             Group(EcsType& original_ecs) : ecs{&original_ecs} {
@@ -1127,7 +1131,7 @@ namespace mgm {
                         group->iterators.emplace(this);
                     }
                 }
-                Iterator(Iterator&& other) {
+                Iterator(Iterator&& other) noexcept {
                     group = other.group;
                     pos = other.pos;
                     if (group != nullptr) {
@@ -1147,7 +1151,7 @@ namespace mgm {
                     }
                     return *this;
                 }
-                Iterator& operator=(Iterator&& other) {
+                Iterator& operator=(Iterator&& other) noexcept {
                     if (this == &other)
                         return *this;
                     group = other.group;
@@ -1411,7 +1415,7 @@ namespace mgm {
                 if (ecs == nullptr)
                     return;
 
-                auto& bucket = const_cast<Ecs*>(ecs)->template get_container<T>().template get<T>();
+                auto& bucket = const_cast<Ecs*>(ecs)->get_container<T>().template get<T>();
                 bucket.iterating_groups.erase(group_container);
 
                 const_cast<Ecs*>(ecs)->groups.erase(ecs->groups.find(group_container));
@@ -1494,7 +1498,7 @@ namespace mgm {
 namespace std {
     template<>
     struct hash<const int* const> {
-        std::size_t operator()(const int* const ptr) const {
+        std::size_t operator()(const int* const ptr) const noexcept {
             return std::hash<std::uintptr_t>()(reinterpret_cast<std::uintptr_t>(ptr));
         }
     };
