@@ -1,29 +1,38 @@
 #pragma once
 #include <algorithm>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <mutex>
-#include <condition_variable>
 
 
 namespace mgm {
-    template <typename, typename T, typename = void> struct has_on_construct : std::false_type {};
-    template <typename C, typename Ret, typename... Args> struct has_on_construct<C, Ret(Args...), std::void_t<decltype(std::declval<C>().on_construct(std::declval<Args>()...))>> : std::true_type {};
-    #define HAS_CONSTRUCT has_on_construct<T, void(Ecs*, const Entity)>{}
+    template<typename, typename T, typename = void>
+    struct has_on_construct : std::false_type {};
+    template<typename C, typename Ret, typename... Args>
+    struct has_on_construct<C, Ret(Args...), std::void_t<decltype(std::declval<C>().on_construct(std::declval<Args>()...))>> : std::true_type {};
+#define HAS_CONSTRUCT \
+    has_on_construct<T, void(Ecs*, const Entity)> {}
 
-    template <typename, typename T, typename = void> struct has_on_access : std::false_type {};
-    template <typename C, typename Ret, typename... Args> struct has_on_access<C, Ret(Args...), std::void_t<decltype(std::declval<C>().on_access(std::declval<Args>()...))>> : std::true_type {};
-    #define HAS_ACCESS has_on_access<T, void(Ecs*, const Entity)>{}
+    template<typename, typename T, typename = void>
+    struct has_on_access : std::false_type {};
+    template<typename C, typename Ret, typename... Args>
+    struct has_on_access<C, Ret(Args...), std::void_t<decltype(std::declval<C>().on_access(std::declval<Args>()...))>> : std::true_type {};
+#define HAS_ACCESS \
+    has_on_access<T, void(Ecs*, const Entity)> {}
 
-    template <typename, typename T, typename = void> struct has_on_destroy : std::false_type {};
-    template <typename C, typename Ret, typename... Args> struct has_on_destroy<C, Ret(Args...), std::void_t<decltype(std::declval<C>().on_destroy(std::declval<Args>()...))>> : std::true_type {};
-    #define HAS_DESTROY has_on_destroy<T, void(Ecs*, const Entity)>{}
+    template<typename, typename T, typename = void>
+    struct has_on_destroy : std::false_type {};
+    template<typename C, typename Ret, typename... Args>
+    struct has_on_destroy<C, Ret(Args...), std::void_t<decltype(std::declval<C>().on_destroy(std::declval<Args>()...))>> : std::true_type {};
+#define HAS_DESTROY \
+    has_on_destroy<T, void(Ecs*, const Entity)> {}
 
 
     template<typename EntityType = uint32_t, bool safety = true>
@@ -38,21 +47,32 @@ namespace mgm {
             static constexpr const int* value = &i;
         };
 
-    public:
+      public:
         class Entity {
-        public:
+          public:
             EntityType value_;
 
             using Type = EntityType;
 
-            constexpr Entity() : value_(null.value_) {}
+            constexpr Entity()
+                : value_(null.value_) {}
 
-            constexpr Entity(EntityType value) : value_(value) {}
+            constexpr Entity(EntityType value)
+                : value_(value) {}
             constexpr explicit operator EntityType() const { return value_; }
 
-            constexpr Entity& operator+=(const Entity& other) { value_ += other.value_; return *this; }
-            constexpr Entity& operator-=(const Entity& other) { value_ -= other.value_; return *this; }
-            constexpr Entity& operator++() { ++value_; return *this; }
+            constexpr Entity& operator+=(const Entity& other) {
+                value_ += other.value_;
+                return *this;
+            }
+            constexpr Entity& operator-=(const Entity& other) {
+                value_ -= other.value_;
+                return *this;
+            }
+            constexpr Entity& operator++() {
+                ++value_;
+                return *this;
+            }
             constexpr Entity operator++(int) { return Entity(value_++); }
 
             // Define more operators as needed
@@ -80,7 +100,7 @@ namespace mgm {
         template<typename T>
         static constexpr TypeID type_of = TypeID(TypeHash<T>::value);
 
-    private:
+      private:
         struct GroupContainer {
             virtual void ecs_moved(Ecs* new_location) = 0;
             virtual void add_unreachable(size_t e) = 0;
@@ -94,14 +114,16 @@ namespace mgm {
                 std::thread::id thread_id{};
                 size_t count = 0;
 
-                LockStatus() : thread_id(std::this_thread::get_id()), count(1) {}
+                LockStatus()
+                    : thread_id(std::this_thread::get_id()),
+                      count(1) {}
             };
             std::unordered_map<T, LockStatus, Hash> set{};
             std::mutex mutex{};
             std::condition_variable cv{};
             bool allow_locking = true;
 
-            private:
+          private:
             void _unlock(const T& e) {
                 const auto it = set.find(e);
                 if (it == set.end())
@@ -114,8 +136,7 @@ namespace mgm {
                     throw std::runtime_error("Trying to unlock an entity that was locked by a different thread");
             }
 
-            public:
-
+          public:
             void unlock(const T& e) {
                 {
                     std::unique_lock lock{mutex};
@@ -139,7 +160,7 @@ namespace mgm {
                 return it != set.end() && it->second.thread_id != std::this_thread::get_id();
             }
 
-            private:
+          private:
             void _wait_and_lock(const T& e) {
                 const auto it = set.find(e);
                 if (it == set.end())
@@ -150,8 +171,7 @@ namespace mgm {
                     throw std::runtime_error("Trying to lock an entity that is already locked by another thread. This should not be possible, this is an internal error.");
             }
 
-            public:
-
+          public:
             void wait_and_lock(const T& e) {
                 {
                     std::unique_lock lock{mutex};
@@ -218,7 +238,7 @@ namespace mgm {
             std::unordered_map<Entity, size_t, typename Entity::Hash> map{};
 
             ThreadSafeSet<Entity, typename Entity::Hash> busy_components{};
-            
+
             std::unordered_set<GroupContainer*> iterating_groups{};
 
             static inline thread_local std::vector<typename decltype(map)::iterator> needs_to_destroy{};
@@ -314,7 +334,7 @@ namespace mgm {
                         group->new_added();
 
                 lock.unlock();
-                
+
                 if constexpr (HAS_CONSTRUCT) {
                     if (ecs != nullptr) {
                         for (const auto& [component, c] : constructed)
@@ -343,7 +363,7 @@ namespace mgm {
                 return const_cast<T&>(val);
             }
 
-            template<typename ... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
+            template<typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
             T& get_or_create(Ecs* ecs, const Entity e, Ts&&... args) {
                 std::unique_lock lock{mutex};
                 const auto it = map.find(e);
@@ -366,7 +386,7 @@ namespace mgm {
                 return const_cast<T*>(val);
             }
 
-        private:
+          private:
             bool __destroy(const size_t c) {
                 if (c == components.size() - 1) {
                     components.pop_back();
@@ -387,7 +407,7 @@ namespace mgm {
                 return true;
             }
 
-        public:
+          public:
             void destroy(Ecs* ecs, const Entity e) {
                 std::unique_lock lock{mutex};
                 const auto it = map.find(e);
@@ -541,11 +561,13 @@ namespace mgm {
             struct Any {
                 void* value = nullptr;
                 std::function<void(void*)> destructor = nullptr;
-                
+
                 template<typename T, typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
                 void emplace(Ts&&... args) {
                     value = new T(std::forward<Ts>(args)...);
-                    destructor = [](void* ptr) { delete static_cast<T*>(ptr); };
+                    destructor = [](void* ptr) {
+                        delete static_cast<T*>(ptr);
+                    };
                 }
 
                 template<typename T>
@@ -682,7 +704,7 @@ namespace mgm {
             std::priority_queue<Entity, std::vector<Entity>, std::greater<Entity>> available{};
             Entity next = zero;
 
-        public:
+          public:
             EntityManager() = default;
             EntityManager(const EntityManager&) = default;
             EntityManager(EntityManager&&) = default;
@@ -729,7 +751,7 @@ namespace mgm {
         std::unordered_map<TypeID, Container*> containers{};
         ThreadSafeSet<Entity, typename Entity::Hash> locks{};
 
-    public:
+      public:
         MGMecs() = default;
         MGMecs(const MGMecs&) = delete;
         MGMecs(MGMecs&& other) noexcept {
@@ -987,7 +1009,7 @@ namespace mgm {
 
             locks.unlock(begin, end);
         }
-        
+
         template<typename T>
         Entity as_entity(const T& component) const {
             const auto* container = try_get_container<T>();
@@ -1014,13 +1036,14 @@ namespace mgm {
 
         template<typename EcsType, typename T = void, typename... Ts>
         struct Group {
-        private:
+          private:
             mutable std::recursive_mutex mutex{};
             bool is_reversed = false;
 
             struct GroupContainerT : public EcsType::GroupContainer {
                 Group<EcsType, T, Ts...>* group{};
-                GroupContainerT(Group<EcsType, T, Ts...>* group_to_hold) : group{group_to_hold} {}
+                GroupContainerT(Group<EcsType, T, Ts...>* group_to_hold)
+                    : group{group_to_hold} {}
 
                 virtual void ecs_moved(Ecs* new_location) override {
                     std::unique_lock lock{group->mutex};
@@ -1039,7 +1062,7 @@ namespace mgm {
                 virtual ~GroupContainerT() override = default;
             };
 
-        public:
+          public:
             GroupContainerT* group_container = nullptr;
             EcsType* ecs = nullptr;
 
@@ -1071,7 +1094,8 @@ namespace mgm {
                 return *this;
             }
 
-            Group(EcsType& original_ecs) : ecs{&original_ecs} {
+            Group(EcsType& original_ecs)
+                : ecs{&original_ecs} {
                 group_container = new GroupContainerT{const_cast<Group<EcsType, T, Ts...>*>(this)};
                 std::unique_lock lock{ecs->mutex};
                 ecs->groups.emplace(group_container);
@@ -1087,9 +1111,9 @@ namespace mgm {
                 const Group* group = nullptr;
                 size_t pos{};
                 std::unordered_set<size_t> unreachable{};
-                bool unreachable_added_since_last_inc: 1 = false;
-                bool is_end: 1 = false;
-                bool is_reversed: 1 = false;
+                bool unreachable_added_since_last_inc : 1 = false;
+                bool is_end : 1 = false;
+                bool is_reversed : 1 = false;
                 Entity locked = null;
 
                 void try_add_unreachable(size_t c) {
@@ -1115,7 +1139,11 @@ namespace mgm {
                     }
                 }
 
-                Iterator(const Group* group_to_iterate, size_t start_pos, bool is_end_iterator = false, bool reverse = false) : group(group_to_iterate), pos(start_pos), is_end(is_end_iterator), is_reversed(reverse) {
+                Iterator(const Group* group_to_iterate, size_t start_pos, bool is_end_iterator = false, bool reverse = false)
+                    : group(group_to_iterate),
+                      pos(start_pos),
+                      is_end(is_end_iterator),
+                      is_reversed(reverse) {
                     if (group_to_iterate != nullptr)
                         group_to_iterate->iterators.emplace(this);
                 }
@@ -1192,7 +1220,7 @@ namespace mgm {
                     return std::pair<Entity, T&>{bucket.original[pos], bucket.components[pos]};
                 }
 
-            private:
+              private:
                 Iterator& inc() {
                     if (group == nullptr)
                         throw std::runtime_error("Incrementing an invalid iterator, or owning group has been destroyed");
@@ -1250,7 +1278,7 @@ namespace mgm {
                 Iterator& dec() {
                     if (group == nullptr)
                         throw std::runtime_error("Decrementing an invalid iterator, or owning group has been destroyed");
-                    
+
                     if (is_end)
                         is_end = false;
 
@@ -1288,7 +1316,7 @@ namespace mgm {
                     return *this;
                 }
 
-            public:
+              public:
                 Iterator& operator++() {
                     if (is_reversed)
                         return dec();
@@ -1351,27 +1379,26 @@ namespace mgm {
                 }
             };
 
-            private:
-                mutable std::unordered_set<Iterator*> iterators{};
+          private:
+            mutable std::unordered_set<Iterator*> iterators{};
 
-                Iterator true_begin() const {
-                    std::unique_lock lock{mutex};
-                    const auto& bucket = ecs->template get_container<T>().template get<T>();
-                    size_t pos = 0;
-                    std::unique_lock bucket_lock{bucket.mutex};
-                    while (!(ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...) && (pos < bucket.components.size()))
-                        ++pos;
-                    return Iterator{this, pos};
-                }
-                Iterator true_end() const {
-                    std::unique_lock lock{mutex};
-                    const auto& bucket = ecs->template get_container<T>().template get<T>();
-                    std::unique_lock bucket_lock{bucket.mutex};
-                    return Iterator{this, bucket.components.size(), true};
-                }
+            Iterator true_begin() const {
+                std::unique_lock lock{mutex};
+                const auto& bucket = ecs->template get_container<T>().template get<T>();
+                size_t pos = 0;
+                std::unique_lock bucket_lock{bucket.mutex};
+                while (!(ecs->template contains_with_include_exclude<Ts>(bucket.original[pos]) && ...) && (pos < bucket.components.size()))
+                    ++pos;
+                return Iterator{this, pos};
+            }
+            Iterator true_end() const {
+                std::unique_lock lock{mutex};
+                const auto& bucket = ecs->template get_container<T>().template get<T>();
+                std::unique_lock bucket_lock{bucket.mutex};
+                return Iterator{this, bucket.components.size(), true};
+            }
 
-            public:
-
+          public:
             Iterator begin() const {
                 Iterator it = is_reversed ? true_end() - 1 : true_begin();
                 it.is_reversed = is_reversed;
@@ -1427,24 +1454,24 @@ namespace mgm {
             }
         };
 
-    private:
+      private:
         mutable std::unordered_set<GroupContainer*> groups{};
 
-        template <class T, template <class...> class Template>
+        template<class T, template<class...> class Template>
         struct is_specialization : std::false_type {};
 
-        template <template <class...> class Template, class... Args>
+        template<template<class...> class Template, class... Args>
         struct is_specialization<Template<Args...>, Template> : std::true_type {};
 
-        template <typename T>
+        template<typename T>
         struct get_specialization_type;
 
-        template <template <typename> class Template, typename T>
+        template<template<typename> class Template, typename T>
         struct get_specialization_type<Template<T>> {
             using type = T;
         };
 
-        template <typename T>
+        template<typename T>
         using get_specialization_type_t = typename get_specialization_type<T>::type;
 
         template<typename IE>
@@ -1457,13 +1484,15 @@ namespace mgm {
             return (contains && is_specialization<IE, Exclude>{}) || (!contains && is_specialization<IE, Include>{});
         }
 
-    public:
-        template<typename T> struct Include{};
-        template<typename T> struct Exclude{};
+      public:
+        template<typename T>
+        struct Include {};
+        template<typename T>
+        struct Exclude {};
 
         template<typename T, typename... Ts>
         Group<Ecs, T, Ts...> group() {
-            if (!container_exists<T>() || (((!container_exists<get_specialization_type_t<Ts>>() && is_specialization<Ts, Include>{}) &&...) && sizeof...(Ts) > 0))
+            if (!container_exists<T>() || (((!container_exists<get_specialization_type_t<Ts>>() && is_specialization<Ts, Include>{}) && ...) && sizeof...(Ts) > 0))
                 return Group<Ecs, T, Ts...>{*this};
 
             return Group<Ecs, T, Ts...>{*this};
@@ -1471,7 +1500,7 @@ namespace mgm {
 
         template<typename T, typename... Ts>
         Group<const Ecs, T, Ts...> group() const {
-            if (!container_exists<T>() || (((!container_exists<get_specialization_type_t<Ts>>() && is_specialization<Ts, Include>{}) &&...) && sizeof...(Ts) > 0))
+            if (!container_exists<T>() || (((!container_exists<get_specialization_type_t<Ts>>() && is_specialization<Ts, Include>{}) && ...) && sizeof...(Ts) > 0))
                 return Group<const Ecs, T, Ts...>{*this};
 
             return Group<const Ecs, T, Ts...>{*this};
@@ -1505,7 +1534,7 @@ namespace mgm {
             }
         }
     };
-}
+} // namespace mgm
 
 
 namespace std {
@@ -1515,4 +1544,4 @@ namespace std {
             return std::hash<std::uintptr_t>()(reinterpret_cast<std::uintptr_t>(ptr));
         }
     };
-}
+} // namespace std
