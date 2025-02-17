@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
@@ -59,6 +60,7 @@ namespace mgm {
 
             constexpr Entity(EntityType value)
                 : value_(value) {}
+
             constexpr explicit operator EntityType() const { return value_; }
 
             constexpr Entity& operator+=(const Entity& other) {
@@ -92,6 +94,7 @@ namespace mgm {
                 std::size_t operator()(const Entity& e) const { return std::hash<EntityType>()(e.value_); }
             };
         };
+
         static constexpr Entity null = static_cast<Entity>(static_cast<EntityType>(-1));
         static constexpr Entity zero = static_cast<Entity>(0);
 
@@ -101,13 +104,6 @@ namespace mgm {
         static constexpr TypeID type_of = TypeID(TypeHash<T>::value);
 
       private:
-        struct GroupContainer {
-            virtual void ecs_moved(Ecs* new_location) = 0;
-            virtual void add_unreachable(size_t e) = 0;
-            virtual void new_added() = 0;
-            virtual ~GroupContainer() = default;
-        };
-
         template<typename T, typename Hash = std::hash<T>>
         struct ThreadSafeSet {
             struct LockStatus {
@@ -237,12 +233,8 @@ namespace mgm {
             std::vector<Entity> original{};
             std::unordered_map<Entity, size_t, typename Entity::Hash> map{};
 
-            ThreadSafeSet<Entity, typename Entity::Hash> busy_components{};
-
-            std::unordered_set<GroupContainer*> iterating_groups{};
-
-            static inline thread_local std::vector<typename decltype(map)::iterator> needs_to_destroy{};
-            static inline thread_local bool is_destroying_something = false;
+            std::vector<size_t> needs_to_destroy{};
+            bool is_destroying_something = false;
 
             ComponentBucket() = default;
 
@@ -254,62 +246,22 @@ namespace mgm {
             template<typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
             T& create(Ecs* ecs, const Entity e, Ts&&... args) {
                 std::unique_lock lock{mutex};
-                if constexpr (safety)
-                    if (map.find(e) != map.end())
-                        throw std::runtime_error("Entity already contains a component of this type");
+                if (is_destroying_something)
+                    throw std::runtime_error("Do not try to create/emplace components from within the on_destroy callback");
+
+                if (map.find(e) != map.end())
+                    throw std::runtime_error("Entity already contains a component of this type");
                 map.emplace(e, components.size());
                 original.emplace_back(e);
                 T& component = components.emplace_back(std::forward<Ts>(args)...);
+
                 if constexpr (HAS_CONSTRUCT)
                     if (ecs != nullptr)
-                        busy_components.wait_and_lock(e);
-
-                for (auto group : iterating_groups)
-                    group->new_added();
-
-                lock.unlock();
-
-                if constexpr (HAS_CONSTRUCT) {
-                    if (ecs != nullptr) {
                         component.on_construct(ecs, e);
-                        busy_components.unlock(e);
-                    }
-                }
 
                 return component;
             }
 
-            template<typename It, typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
-            void create(Ecs* ecs, const It& begin, const It& end, Ts&&... args) {
-                std::vector<std::pair<T*, size_t>> constructed{};
-                constructed.reserve(std::distance(begin, end));
-
-                std::unique_lock lock{mutex};
-
-                busy_components.wait_and_lock(begin, end);
-
-                for (auto it = begin; it != end; ++it) {
-                    if constexpr (safety)
-                        if (map.find(*it) != map.end())
-                            throw std::runtime_error("Entity already contains a component of this type");
-                    map.emplace(*it, components.size());
-                    original.emplace_back(*it);
-                    constructed.emplace_back(&components.emplace_back(std::forward<Ts>(args)...), components.size() - 1);
-                }
-
-                for (auto group : iterating_groups)
-                    group->new_added();
-
-                lock.unlock();
-
-                if constexpr (HAS_CONSTRUCT) {
-                    if (ecs != nullptr) {
-                        for (const auto& [component, c] : constructed)
-                            component->on_construct(ecs, original[c]);
-                        busy_components.unlock(begin, end);
-                    }
-                }
-            }
             template<typename It, typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
             void try_create(Ecs* ecs, const It& begin, const It& end, Ts&&... args) {
                 std::vector<std::pair<T*, size_t>> constructed{};
@@ -319,8 +271,6 @@ namespace mgm {
 
                 const auto original_size = original.size();
 
-                busy_components.wait_and_lock(begin, end);
-
                 for (auto it = begin; it != end; ++it) {
                     if (map.find(*it) != map.end())
                         continue;
@@ -329,19 +279,12 @@ namespace mgm {
                     constructed.emplace_back(&components.emplace_back(std::forward<Ts>(args)...), components.size() - 1);
                 }
 
-                if (original.size() > original_size)
-                    for (auto group : iterating_groups)
-                        group->new_added();
-
                 lock.unlock();
 
-                if constexpr (HAS_CONSTRUCT) {
-                    if (ecs != nullptr) {
+                if constexpr (HAS_CONSTRUCT)
+                    if (ecs != nullptr)
                         for (const auto& [component, c] : constructed)
                             component->on_construct(ecs, original[c]);
-                        busy_components.unlock(begin, end);
-                    }
-                }
             }
 
             const T& get(const Entity e) const {
@@ -400,68 +343,10 @@ namespace mgm {
                 components.pop_back();
                 original.pop_back();
 
-                if (!iterating_groups.empty())
-                    for (auto group : iterating_groups)
-                        group->add_unreachable(c);
-
                 return true;
             }
 
           public:
-            void destroy(Ecs* ecs, const Entity e) {
-                std::unique_lock lock{mutex};
-                const auto it = map.find(e);
-                if constexpr (safety)
-                    if (it == map.end())
-                        throw std::runtime_error("Entity doesn't contain a component of this type");
-
-                auto c = it->second;
-                busy_components.wait_and_lock(e);
-
-                if constexpr (HAS_DESTROY) {
-                    if (ecs != nullptr) {
-                        if (is_destroying_something) {
-                            busy_components.wait_and_lock(e);
-                            components[c].on_destroy(ecs, e);
-                            needs_to_destroy.emplace_back(it);
-                            return;
-                        }
-                        is_destroying_something = true;
-                        components[c].on_destroy(ecs, e);
-
-                        for (const auto& nc : needs_to_destroy) {
-                            const auto nc_c = nc->second;
-                            const auto nc_e = nc->first;
-                            map.erase(nc);
-                            __destroy(nc_c);
-                            busy_components.unlock(nc_e);
-                            if (nc_c < c) {
-                                if (c == components.size() - 1)
-                                    c = nc_c;
-                                else
-                                    --c;
-                            }
-                        }
-                        needs_to_destroy.clear();
-
-                        map.erase(it);
-                        __destroy(c);
-                        busy_components.unlock(e);
-
-                        is_destroying_something = false;
-                    }
-                }
-                else {
-                    if (!is_destroying_something) {
-                        map.erase(it);
-                        __destroy(c);
-                    }
-                    else {
-                        busy_components.wait_and_lock(e);
-                        needs_to_destroy.emplace_back(it);
-                    }
-                }
-            }
             bool try_destroy(Ecs* ecs, const Entity e) {
                 std::unique_lock lock{mutex};
                 const auto it = map.find(e);
@@ -469,89 +354,125 @@ namespace mgm {
                     return false;
 
                 auto c = it->second;
-                busy_components.wait_and_lock(e);
 
                 if constexpr (HAS_DESTROY) {
-                    if (ecs != nullptr) {
-                        if (is_destroying_something) {
-                            busy_components.wait_and_lock(e);
-                            components[c].on_destroy(ecs, e);
-                            needs_to_destroy.emplace_back(it);
-                            return true;
-                        }
-                        is_destroying_something = true;
+                    if (ecs == nullptr)
+                        return false;
+
+                    if (is_destroying_something) {
+                        lock.unlock();
                         components[c].on_destroy(ecs, e);
-
-                        for (const auto& nc : needs_to_destroy) {
-                            const auto nc_c = nc->second;
-                            const auto nc_e = nc->first;
-                            map.erase(nc);
-                            __destroy(nc_c);
-                            busy_components.unlock(nc_e);
-                            if (nc_c < c) {
-                                if (c == components.size() - 1)
-                                    c = nc_c;
-                                else
-                                    --c;
-                            }
-                        }
-                        needs_to_destroy.clear();
-
-                        map.erase(it);
-                        if (!__destroy(c)) {
-                            busy_components.unlock(e);
-                            is_destroying_something = false;
-                            return false;
-                        }
-                        busy_components.unlock(e);
-
-                        is_destroying_something = false;
+                        lock.lock();
+                        needs_to_destroy.emplace_back(c);
+                        return true;
                     }
-                    return true;
+                    is_destroying_something = true;
+
+                    lock.unlock();
+                    components[c].on_destroy(ecs, e);
+                    lock.lock();
+
+                    needs_to_destroy.emplace_back(c);
+
+                    std::sort(needs_to_destroy.begin(), needs_to_destroy.end(), [](const size_t& lh, const size_t& rh) {
+                        return lh > rh;
+                    });
+
+                    bool success = true;
+
+                    for (const auto nc : needs_to_destroy) {
+                        const auto ne = original[nc];
+                        map.erase(ne);
+                        success &= __destroy(nc);
+                    }
+                    needs_to_destroy.clear();
+                    is_destroying_something = false;
+                    return success;
                 }
                 else {
-                    map.erase(it);
-                    return __destroy(c);
-                }
-            }
-
-            template<typename It>
-            void destroy(Ecs* ecs, const It& begin, const It& end) {
-                std::unique_lock lock{mutex};
-
-                std::vector<Entity> to_delete{begin, end};
-
-                std::sort(to_delete.begin(), to_delete.end(), [&](const Entity lhs, const Entity rhs) {
-                    return map.at(lhs) < map.at(rhs);
-                });
-
-                for (auto it = begin; it != end; ++it)
-                    destroy(ecs, *it);
-            }
-            template<typename It>
-            void try_destroy(Ecs* ecs, const It& begin, const It& end) {
-                std::unique_lock lock{mutex};
-
-                std::vector<Entity> to_delete{begin, end};
-
-                for (size_t i = 0; i < to_delete.size(); ++i) {
-                    if (!map.contains(to_delete[i])) {
-                        to_delete.erase(to_delete.begin() + i);
-                        --i;
+                    if (!is_destroying_something) {
+                        map.erase(it);
+                        __destroy(c);
                     }
+                    else
+                        needs_to_destroy.emplace_back(c);
+                    return true;
+                }
+            }
+
+            template<typename It>
+            bool try_destroy(Ecs* ecs, const It& begin, const It& end, bool abort_on_invalid = false) {
+                std::unique_lock lock{mutex};
+
+                std::vector<size_t> to_delete{};
+                to_delete.reserve(std::distance(begin, end));
+
+                for (auto it = begin; it != end; ++it) {
+                    const auto mit = map.find(*it);
+                    if (mit != map.end())
+                        to_delete.emplace_back(mit->second);
+                    else if (abort_on_invalid)
+                        return false;
                 }
 
-                std::sort(to_delete.begin(), to_delete.end(), [&](const Entity lhs, const Entity rhs) {
-                    return map.at(lhs) < map.at(rhs);
-                });
+                if constexpr (HAS_DESTROY) {
+                    if (ecs == nullptr)
+                        return false;
 
-                for (auto it = begin; it != end; ++it)
-                    try_destroy(ecs, *it);
+                    if (is_destroying_something) {
+                        lock.unlock();
+                        for (const auto c : to_delete)
+                            components[c].on_destroy(ecs, original[c]);
+                        lock.lock();
+                        needs_to_destroy.insert(needs_to_destroy.end(), to_delete.begin(), to_delete.end());
+                        return true;
+                    }
+                    is_destroying_something = true;
+
+                    lock.unlock();
+                    for (const auto c : to_delete)
+                        components[c].on_destroy(ecs, original[c]);
+                    lock.lock();
+
+                    needs_to_destroy.insert(needs_to_destroy.end(), to_delete.begin(), to_delete.end());
+
+                    std::sort(needs_to_destroy.begin(), needs_to_destroy.end(), [](const size_t& lh, const size_t& rh) {
+                        return lh > rh;
+                    });
+
+                    bool success = true;
+
+                    for (const auto nc : needs_to_destroy) {
+                        const auto ne = original[nc];
+                        map.erase(ne);
+                        success &= __destroy(nc);
+                    }
+                    needs_to_destroy.clear();
+                    is_destroying_something = false;
+                    return success;
+                }
+                else {
+                    if (!is_destroying_something) {
+                        std::sort(to_delete.begin(), to_delete.end(), [](const size_t& lh, const size_t& rh) {
+                            return lh > rh;
+                        });
+                        for (const auto c : to_delete) {
+                            map.erase(original[c]);
+                            __destroy(c);
+                        }
+                    }
+                    else
+                        needs_to_destroy.insert(needs_to_destroy.end(), to_delete.begin(), to_delete.end());
+                    return true;
+                }
             }
 
             void destroy_all(Ecs* ecs) {
+                std::unique_lock lock{mutex};
                 const auto original_copy = original;
-                destroy(ecs, original_copy.begin(), original_copy.end());
+                lock.unlock();
+
+                try_destroy(ecs, original_copy.begin(), original_copy.end());
             }
         };
 
@@ -607,7 +528,6 @@ namespace mgm {
             }
 
             virtual bool empty() const = 0;
-            virtual void destroy(Ecs* ecs, const Entity e) = 0;
             virtual void try_destroy(Ecs* ecs, const Entity e) = 0;
             virtual void try_destroy(Ecs* ecs, const std::vector<Entity>& entities) = 0;
             virtual bool contains(const Entity e) const = 0;
@@ -653,15 +573,11 @@ namespace mgm {
                     auto& bucket = Container::template get<T>();
                     return bucket.empty();
                 }
-                virtual void destroy(Ecs* ecs, const Entity e) override {
-                    auto& bucket = Container::template get<T>();
-                    bucket.destroy(ecs, e);
-                }
                 virtual void try_destroy(Ecs* ecs, const Entity e) override {
                     auto& bucket = Container::template get<T>();
                     if (bucket.try_get(e) == nullptr)
                         return;
-                    bucket.destroy(ecs, e);
+                    bucket.try_destroy(ecs, e);
                 }
                 virtual void try_destroy(Ecs* ecs, const std::vector<Entity>& es) override {
                     auto& bucket = Container::template get<T>();
@@ -766,10 +682,6 @@ namespace mgm {
             entities = std::move(other.entities);
             containers = std::move(other.containers);
             locks = std::move(other.locks);
-            groups = std::move(other.groups);
-
-            for (const auto& group : groups)
-                group->ecs_moved(this);
 
             locks.unlock_set();
         }
@@ -786,10 +698,6 @@ namespace mgm {
             entities = std::move(other.entities);
             containers = std::move(other.containers);
             locks = std::move(other.locks);
-            groups = std::move(other.groups);
-
-            for (const auto& group : groups)
-                group->ecs_moved(this);
 
             locks.unlock_set();
 
@@ -822,7 +730,8 @@ namespace mgm {
         template<typename T, typename It, typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
         void emplace(const It& begin, const It& end, Ts&&... args) {
             auto& bucket = get_or_create_container<T>().template get<T>();
-            bucket.create(this, begin, end, std::forward<Ts>(args)...);
+            if (!bucket.try_create(this, begin, end, std::forward<Ts>(args)...))
+                throw std::runtime_error("Could not emplace a component on one of the entities");
         }
         template<typename T, typename It, typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, bool> = true>
         void try_emplace(const It& begin, const It& end, Ts&&... args) {
@@ -878,7 +787,8 @@ namespace mgm {
         void remove(const Entity e) {
             auto& bucket = get_container<T>().template get<T>();
             locks.wait_and_lock(e);
-            bucket.destroy(this, e);
+            if (!bucket.try_destroy(this, e))
+                throw std::runtime_error("Could not remove component from entity");
             locks.unlock(e);
         }
         template<typename T>
@@ -895,7 +805,7 @@ namespace mgm {
         void remove(const It& begin, const It& end) {
             auto& bucket = get_container<T>().template get<T>();
             locks.wait_and_lock(begin, end);
-            bucket.destroy(this, begin, end);
+            bucket.try_destroy(this, begin, end);
             locks.unlock(begin, end);
         }
         template<typename T, typename It>
@@ -913,15 +823,9 @@ namespace mgm {
 
             std::unique_lock lock{mutex};
             entities.destroy(e);
-            std::vector<Container*> to_destroy{};
-            to_destroy.reserve(containers.size());
-            for (auto& [type, container] : containers)
-                if (container->contains(e))
-                    to_destroy.push_back(container);
-            lock.unlock();
 
-            for (auto& container : to_destroy)
-                container->destroy(this, e);
+            for (auto& [type, container] : containers)
+                container->try_destroy(this, e);
 
             locks.unlock(e);
         }
@@ -932,14 +836,7 @@ namespace mgm {
             if (!entities.try_destroy(e))
                 return;
 
-            std::vector<Container*> to_destroy{};
-            to_destroy.reserve(containers.size());
             for (auto& [type, container] : containers)
-                if (container->contains(e))
-                    to_destroy.push_back(container);
-            lock.unlock();
-
-            for (auto& container : to_destroy)
                 container->try_destroy(this, e);
 
             locks.unlock(e);
@@ -952,10 +849,9 @@ namespace mgm {
                 return;
 
             std::vector<Entity> entities_to_destroy{};
-            std::vector<Container*> to_destroy{};
+            entities_to_destroy.reserve(dist);
 
             std::unique_lock lock{mutex};
-            entities_to_destroy.reserve(dist);
 
             locks.wait_and_lock(begin, end);
 
@@ -964,13 +860,7 @@ namespace mgm {
                 entities_to_destroy.push_back(*it);
             }
 
-            to_destroy.reserve(containers.size());
             for (auto& [type, container] : containers)
-                to_destroy.push_back(container);
-
-            lock.unlock();
-
-            for (auto& container : to_destroy)
                 container->try_destroy(this, entities_to_destroy);
 
             locks.unlock(begin, end);
@@ -978,7 +868,6 @@ namespace mgm {
         template<typename It>
         void try_destroy(const It& begin, const It& end) {
             std::vector<Entity> entities_to_destroy{};
-            std::vector<Container*> to_destroy{};
 
             std::unique_lock lock{mutex};
             entities_to_destroy.reserve(std::distance(begin, end));
@@ -998,13 +887,7 @@ namespace mgm {
                 return;
             }
 
-            to_destroy.reserve(containers.size());
             for (auto& [type, container] : containers)
-                to_destroy.push_back(container);
-
-            lock.unlock();
-
-            for (auto& container : to_destroy)
                 container->try_destroy(this, entities_to_destroy);
 
             locks.unlock(begin, end);
@@ -1455,8 +1338,6 @@ namespace mgm {
         };
 
       private:
-        mutable std::unordered_set<GroupContainer*> groups{};
-
         template<class T, template<class...> class Template>
         struct is_specialization : std::false_type {};
 
@@ -1492,17 +1373,11 @@ namespace mgm {
 
         template<typename T, typename... Ts>
         Group<Ecs, T, Ts...> group() {
-            if (!container_exists<T>() || (((!container_exists<get_specialization_type_t<Ts>>() && is_specialization<Ts, Include>{}) && ...) && sizeof...(Ts) > 0))
-                return Group<Ecs, T, Ts...>{*this};
-
             return Group<Ecs, T, Ts...>{*this};
         }
 
         template<typename T, typename... Ts>
         Group<const Ecs, T, Ts...> group() const {
-            if (!container_exists<T>() || (((!container_exists<get_specialization_type_t<Ts>>() && is_specialization<Ts, Include>{}) && ...) && sizeof...(Ts) > 0))
-                return Group<const Ecs, T, Ts...>{*this};
-
             return Group<const Ecs, T, Ts...>{*this};
         }
 
