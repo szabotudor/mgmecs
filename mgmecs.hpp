@@ -527,16 +527,6 @@ namespace mgm {
                 cv.notify_all();
             }
 
-            template<typename Mutex>
-            void preemptive_lock(std::unique_lock<Mutex>& bucket_lock, const Entity e) {
-                std::unique_lock lock{mutex};
-                bucket_lock.unlock();
-
-                cv.wait(lock, [&]() {
-                    return allow_locking;
-                });
-            }
-
             ~ThreadSafeSet() = default;
         };
 
@@ -551,48 +541,59 @@ namespace mgm {
             std::any base{};
             std::function<void(GenericIteratorHelper* gih)> inc{};
             std::function<void(GenericIteratorHelper* gih)> dec{};
-            std::function<T&(GenericIteratorHelper* gih)> deref{};
+            std::function<T*(GenericIteratorHelper* gih)> deref{};
             std::function<bool(const GenericIteratorHelper* gih1, const GenericIteratorHelper* gih2)> cmp{};
+            std::function<difference_type(const GenericIteratorHelper* gih1, const GenericIteratorHelper* gih2)> dif{};
 
             template<typename U, std::enable_if_t<!std::is_same_v<U, GenericIteratorHelper<T>>, bool> = true>
             GenericIteratorHelper(U& base_iterator)
                 : base{base_iterator},
                   inc([](GenericIteratorHelper* gih) {
-                      U& base = std::any_cast<U&>(gih->base);
-                      ++base;
+                      U& base_data = std::any_cast<U&>(gih->base);
+                      ++base_data;
                   }),
                   dec([](GenericIteratorHelper* gih) {
-                      U& base = std::any_cast<U&>(gih->base);
-                      --base;
+                      U& base_data = std::any_cast<U&>(gih->base);
+                      --base_data;
                   }),
-                  deref([](GenericIteratorHelper* gih) -> T& {
-                      U& base = std::any_cast<U&>(gih->base);
-                      return *base;
+                  deref([](GenericIteratorHelper* gih) -> T* {
+                      U& base_data = std::any_cast<U&>(gih->base);
+                      return &*base_data;
                   }),
                   cmp([](const GenericIteratorHelper* gih1, const GenericIteratorHelper* gih2) {
-                      U& base1 = std::any_cast<U&>(gih1->base);
-                      U& base2 = std::any_cast<U&>(gih2->base);
-                      return base1 == base2;
+                      U& base_data1 = std::any_cast<U&>(gih1->base);
+                      U& base_data2 = std::any_cast<U&>(gih2->base);
+                      return base_data1 == base_data2;
+                  }),
+                  dif([](const GenericIteratorHelper* gih1, const GenericIteratorHelper* gih2) -> difference_type {
+                      U& base_data1 = std::any_cast<U&>(gih1->base);
+                      U& base_data2 = std::any_cast<U&>(gih2->base);
+                      return base_data1 - base_data2;
                   }) {}
             template<typename U, std::enable_if_t<!std::is_same_v<U, GenericIteratorHelper<T>>, bool> = true>
             GenericIteratorHelper(const U& base_iterator)
                 : base{base_iterator},
                   inc([](GenericIteratorHelper* gih) {
-                      const U& base = std::any_cast<const U&>(gih->base);
-                      gih->base = base + 1;
+                      const U& base_data = std::any_cast<const U&>(gih->base);
+                      gih->base = base_data + 1;
                   }),
                   dec([](GenericIteratorHelper* gih) {
-                      const U& base = std::any_cast<const U&>(gih->base);
-                      gih->base = base + 1;
+                      const U& base_data = std::any_cast<const U&>(gih->base);
+                      gih->base = base_data + 1;
                   }),
-                  deref([](GenericIteratorHelper* gih) -> T& {
-                      const U& base = std::any_cast<const U&>(gih->base);
-                      return *base;
+                  deref([](GenericIteratorHelper* gih) -> T* {
+                      const U& base_data = std::any_cast<const U&>(gih->base);
+                      return const_cast<T*>(&*base_data);
                   }),
                   cmp([](const GenericIteratorHelper* gih1, const GenericIteratorHelper* gih2) {
-                      const U& base1 = std::any_cast<const U&>(gih1->base);
-                      const U& base2 = std::any_cast<const U&>(gih2->base);
-                      return base1 == base2;
+                      const U& base_data1 = std::any_cast<const U&>(gih1->base);
+                      const U& base_data2 = std::any_cast<const U&>(gih2->base);
+                      return base_data1 == base_data2;
+                  }),
+                  dif([](const GenericIteratorHelper* gih1, const GenericIteratorHelper* gih2) -> difference_type {
+                      const U& base_data1 = std::any_cast<const U&>(gih1->base);
+                      const U& base_data2 = std::any_cast<const U&>(gih2->base);
+                      return base_data1 - base_data2;
                   }) {}
 
             GenericIteratorHelper() = delete;
@@ -603,17 +604,17 @@ namespace mgm {
             GenericIteratorHelper& operator=(GenericIteratorHelper&&) = default;
 
             T& operator*() {
-                return deref(this);
+                return *deref(this);
             }
             const T& operator*() const {
-                return deref(const_cast<GenericIteratorHelper*>(this));
+                return *deref(const_cast<GenericIteratorHelper*>(this));
             }
 
             T* operator->() {
-                return &deref(this);
+                return deref(this);
             }
             const T* operator->() const {
-                return &deref(const_cast<GenericIteratorHelper*>(this));
+                return deref(const_cast<GenericIteratorHelper*>(this));
             }
 
             GenericIteratorHelper& operator++() {
@@ -643,7 +644,7 @@ namespace mgm {
             }
 
             size_t operator-(const GenericIteratorHelper& other) const {
-                return 1;
+                return dif(this, &other);
             }
         };
 
@@ -766,7 +767,7 @@ namespace mgm {
                     return {};
 
                 if (currently_calling)
-                    throw std::runtime_error("INTERNAL ERROR: Don't call the callback manager from inside of a callback arlready being executed");
+                    throw std::runtime_error("INTERNAL ERROR: Don't call the callback manager from inside of a callback already being executed");
 
                 currently_calling = true;
 
@@ -774,8 +775,8 @@ namespace mgm {
                     res.emplace_back(cb(std::forward<Args>(args)...));
 
                 currently_calling = false;
-                for (const auto& [key, p] : to_destroy_after_calls)
-                    callbacks.at(key).callbacks.erase(p);
+                for (const auto& [k, p] : to_destroy_after_calls)
+                    callbacks.at(k).callbacks.erase(p);
                 to_destroy_after_calls.clear();
 
                 return res;
@@ -793,8 +794,8 @@ namespace mgm {
                     cb(std::forward<Args>(args)...);
 
                 currently_calling = false;
-                for (const auto& [key, p] : to_destroy_after_calls)
-                    callbacks.at(key).callbacks.erase(p);
+                for (const auto& [k, p] : to_destroy_after_calls)
+                    callbacks.at(k).callbacks.erase(p);
                 to_destroy_after_calls.clear();
             }
         };
@@ -804,8 +805,8 @@ namespace mgm {
             mutable std::recursive_mutex mutex{};
 
             struct Component {
-                EntityType c : (sizeof(EntityType) * 8 - 1) = 0;
                 bool latent_destruction : 1 = false;
+                EntityType c : (sizeof(EntityType) * 8 - 1) = 0;
 
                 Component() = default;
 
@@ -813,17 +814,17 @@ namespace mgm {
                     return static_cast<EntityType>(c);
                 }
 
-                Component(const EntityType base)
-                    : c(base) {}
+                Component(const size_t base)
+                    : c(base & ((EntityType(1) << (sizeof(EntityType) * 8 - 1)) - 1)) {}
 
                 template<std::enable_if_t<!std::is_same_v<EntityType, size_t>, bool> = true>
                 Component(const size_t base)
-                    : c(static_cast<EntityType>(base)) {}
+                    : c(static_cast<EntityType>(base) & ((EntityType(1) << (sizeof(EntityType) * 8 - 1)) - 1)) {}
 
-                friend Component operator+(const EntityType& s, const Component& c) { return Component{s + c.c}; }
-                friend Component operator-(const EntityType& s, const Component& c) { return Component{s - c.c}; }
-                friend Component operator*(const EntityType& s, const Component& c) { return Component{s * c.c}; }
-                friend Component operator/(const EntityType& s, const Component& c) { return Component{s / c.c}; }
+                friend Component operator+(const EntityType& s, const Component& comp) { return Component{s + comp.c}; }
+                friend Component operator-(const EntityType& s, const Component& comp) { return Component{s - comp.c}; }
+                friend Component operator*(const EntityType& s, const Component& comp) { return Component{s * comp.c}; }
+                friend Component operator/(const EntityType& s, const Component& comp) { return Component{s / comp.c}; }
 
                 Component operator+(const Component& other) { return {c + other.c}; }
                 Component operator-(const Component& other) { return {c - other.c}; }
@@ -1009,7 +1010,7 @@ namespace mgm {
 
                     const auto ldc = ldc_id_p++;
                     latent_destruction_components.emplace(ldc, &temp);
-                    c.c = ldc;
+                    c = ldc;
                     c.latent_destruction = true;
 
                     lock.unlock();
@@ -1037,7 +1038,7 @@ namespace mgm {
                 std::unique_lock lock{mutex};
 
                 static thread_local std::vector<Component*> to_delete{};
-                if (to_delete.capacity() < dist)
+                if (static_cast<decltype(dist)>(to_delete.capacity()) < dist)
                     to_delete.reserve(dist);
                 to_delete.clear();
 
@@ -1067,7 +1068,7 @@ namespace mgm {
                         temps.emplace_back(std::move(components[c->c]), original[c->c], ldc);
                         _destroy(ecs, *c);
                         latent_destruction_components.emplace(ldc, &temps.back().t);
-                        c->c = ldc;
+                        *c = ldc;
                         c->latent_destruction = true;
                     }
 
@@ -1130,7 +1131,7 @@ namespace mgm {
             const auto it = buckets.find(TypeID<T>{});
             if (it == buckets.end())
                 return nullptr;
-            return it->second;
+            return reinterpret_cast<const ComponentBucket<T>*>(it->second);
         }
 
         template<typename T>
@@ -1495,7 +1496,7 @@ namespace mgm {
             }
 
           public:
-            Group(const std::nullptr_t none) {}
+            Group(const std::nullptr_t) {}
 
             Group(EcsType& from_ecs, const GroupCond& condition = {})
                 : ecs(&from_ecs),
